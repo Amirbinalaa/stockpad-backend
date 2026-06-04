@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+
+# Environment variables (NEVER commit this)
+.env
+
+# Django
+*.log
+db.sqlite3
+staticfiles/
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
