@@ -30,29 +30,32 @@ CSRF_TRUSTED_ORIGINS = [
 ]
 
 INSTALLED_APPS = [
+    # Media & Static Storage
+    'cloudinary_storage',
+    
+    # Django core apps
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    # Third-party
+    'cloudinary',
+
+    # Third-party apps
     "rest_framework",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
     "django_filters",
     "corsheaders",
     "drf_spectacular",
+
     # Local apps
     "users",
     "inventory",
     "notifications",
     "reports",
     "settings_app",
-    #media storage
-    'cloudinary_storage',
-    'django.contrib.staticfiles',
-    "cloudinary",
 ]
 
 AUTH_USER_MODEL = "users.User"
