@@ -1,13 +1,15 @@
+import hashlib
+import hmac
+import json
+
+from django.conf import settings
+from django.db import models
 from django.db import transaction as db_transaction
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from django.db import models
-import hashlib
-import hmac
-import json
 import requests
 
 from settings_app.models import UserPreference
@@ -21,7 +23,6 @@ from .serializers import (
     MaterialRequestReviewSerializer,
     MaterialRequestCreateSerializer,
 )
-from django.conf import settings
 
 
 class MaterialListCreateView(generics.ListCreateAPIView):
