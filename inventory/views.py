@@ -5,6 +5,9 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db import models
+import hashlib
+import hmac
+import json
 import requests
 
 from settings_app.models import UserPreference
@@ -143,6 +146,36 @@ class HasSiteBAPIKey(permissions.BasePermission):
         return api_key == expected_key
 
 
+def _build_webhook_headers(payload: dict) -> dict:
+    """
+    Serialize payload to JSON bytes and compute an HMAC-SHA256 signature
+    using SITE_A_API_KEY. Returns headers dict ready to pass to requests.post().
+    """
+    secret = getattr(settings, "SITE_A_API_KEY", "").encode("utf-8")
+    body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
+    return {
+        "Content-Type": "application/json",
+        "X-Site-A-Signature": signature,
+    }
+
+
+class MaterialCatalogView(generics.ListAPIView):
+    """
+    Read-only materials catalog for Site B.
+    Returns id, name, unit, and current_quantity for all active materials.
+    Protected by the same X-Site-B-API-Key used for request creation.
+    """
+    permission_classes = [HasSiteBAPIKey]
+    authentication_classes = []
+
+    def get(self, request, *args, **kwargs):
+        materials = Material.objects.filter(is_active=True).order_by("name").values(
+            "id", "name", "unit", "current_quantity"
+        )
+        return Response(list(materials))
+
+
 class MaterialRequestListView(generics.ListAPIView):
     serializer_class = MaterialRequestSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -229,7 +262,12 @@ class MaterialRequestReviewView(generics.UpdateAPIView):
                 "status": instance.status,
             }
             try:
-                requests.post(instance.webhook_url, json=payload, timeout=5)
+                requests.post(
+                    instance.webhook_url,
+                    data=json.dumps(payload, separators=(",", ":")),
+                    headers=_build_webhook_headers(payload),
+                    timeout=5,
+                )
             except requests.RequestException:
                 pass
 
@@ -276,7 +314,12 @@ class MaterialRequestCreateView(generics.CreateAPIView):
                 "status": instance.status,
             }
             try:
-                requests.post(instance.webhook_url, json=payload, timeout=5)
+                requests.post(
+                    instance.webhook_url,
+                    data=json.dumps(payload, separators=(",", ":")),
+                    headers=_build_webhook_headers(payload),
+                    timeout=5,
+                )
             except requests.RequestException:
                 pass
 

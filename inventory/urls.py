@@ -4,6 +4,7 @@ from .views import (
     DashboardSummaryView,
     MaterialDetailView,
     MaterialListCreateView,
+    MaterialCatalogView,
     ReportView,
     StockTransactionListCreateView,
     MaterialRequestListView,
@@ -27,6 +28,9 @@ urlpatterns = [
     path("reports/", ReportView.as_view(), name="reports"),
     path("insights/", AIInsightsView.as_view(), name="insights"),
     
+    # Site B — Public API Key-protected endpoints
+    path("materials/catalog/", MaterialCatalogView.as_view(), name="material-catalog"),
+
     # Material Requests
     path("requests/list/", MaterialRequestListView.as_view(), name="request-list"),
     path("requests/<int:pk>/review/", MaterialRequestReviewView.as_view(), name="request-review"),
