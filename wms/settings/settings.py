@@ -8,6 +8,7 @@ env = environ.Env(
     DEBUG=(bool, False),
 )
 
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 environ.Env.read_env(BASE_DIR / ".env", overwrite=True)
@@ -17,17 +18,20 @@ SECRET_KEY = env("SECRET_KEY", default="changeme")
 DEBUG = env.bool("DEBUG", default=True)
 
 ALLOWED_HOSTS: list[str] = ["*"]
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5500",
-    "http://127.0.0.1:5500",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5000",
-    "http://127.0.0.1:5000",
-    "http://localhost:5501",
-    "http://127.0.0.1:5501",
-    "https://stockpad.netlify.app",
-]
+CSRF_TRUSTED_ORIGINS = env.list(
+    "CSRF_TRUSTED_ORIGINS",
+    default=[
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5000",
+        "http://127.0.0.1:5000",
+        "http://localhost:5501",
+        "http://127.0.0.1:5501",
+        "https://stockpad-app.netlify.app",
+    ],
+)
 
 INSTALLED_APPS = [
     # Media & Static Storage
@@ -61,8 +65,8 @@ INSTALLED_APPS = [
 AUTH_USER_MODEL = "users.User"
 
 MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -170,18 +174,21 @@ SPECTACULAR_SETTINGS = {
 CORS_ALLOW_ALL_ORIGINS = False
 
 # Additional CORS settings for better frontend compatibility
-CORS_ALLOWED_ORIGINS = [
+_DEFAULT_CORS_ORIGINS = [
     "http://localhost:5500",
     "http://127.0.0.1:5500",
+    "http://localhost:5501",
+    "http://127.0.0.1:5501",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5000",
     "http://127.0.0.1:5000",
-    "http://localhost:5501",
-    "http://127.0.0.1:5501",
-    "https://stockpad.netlify.app",
-    "https://stockpad-warehouse.vercel.app",  # Add your frontend production domain here if needed
+    "https://stockpad-app.netlify.app",
+    "https://stockpad-warehouse.vercel.app",
 ]
+CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=_DEFAULT_CORS_ORIGINS)
+APPEND_SLASH = False
+
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     "accept",
@@ -239,3 +246,14 @@ CLOUDINARY_STORAGE = {
 
 # توجيه الميديا لـ Cloudinary
 DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+
+SECURE_CROSS_ORIGIN_OPENER_POLICY = None
+
+import os
+if os.environ.get('DJANGO_ENV') != 'production':
+    DEBUG = True
+    SECURE_SSL_REDIRECT = False
+    SECURE_PROXY_SSL_HEADER = None
+    SESSION_COOKIE_SECURE = False
+    CSRF_COOKIE_SECURE = False
+

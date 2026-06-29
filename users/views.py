@@ -318,7 +318,7 @@ class ResetPasswordConfirmView(APIView):
         return Response({"detail": "Password reset successfully."})
 
 
-# Google OAuth View
+
 class GoogleAuthView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -327,55 +327,49 @@ class GoogleAuthView(APIView):
 
     def post(self, request):
         token = request.data.get('credential')
+        is_access_token = request.data.get('isAccessToken', False)
+
         if not token:
-            return Response(
-                {'detail': 'Token is required.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'detail': 'Token is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         client_id = (settings.GOOGLE_CLIENT_ID or "").strip()
         if not client_id:
-            return Response(
-                {"detail": "Google sign-in is not configured on the server."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
+            return Response({"detail": "Google sign-in is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         try:
-            idinfo = id_token.verify_oauth2_token(
-                token,
-                google_requests.Request(),
-                client_id,
-            )
+            if is_access_token:
+                import requests as http_requests
+                r = http_requests.get(
+                    'https://www.googleapis.com/oauth2/v3/userinfo',
+                    headers={'Authorization': f'Bearer {token}'},
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    return Response({"detail": "Invalid Google access token."}, status=status.HTTP_401_UNAUTHORIZED)
+                idinfo = r.json()
+            else:
+                idinfo = id_token.verify_oauth2_token(
+                    token, google_requests.Request(), client_id,
+                )
 
             if not idinfo.get("email_verified"):
-                return Response(
-                    {"detail": "Google email is not verified."},
-                    status=status.HTTP_401_UNAUTHORIZED,
-                )
+                return Response({"detail": "Google email is not verified."}, status=status.HTTP_401_UNAUTHORIZED)
 
             email = (idinfo.get('email') or '').strip().lower()
             if not email:
-                return Response(
-                    {"detail": "Google account has no email."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                return Response({"detail": "Google account has no email."}, status=status.HTTP_400_BAD_REQUEST)
 
-            name      = idinfo.get('name', '')
-            google_id = idinfo.get('sub')
+            name = idinfo.get('name', '')
 
-            # Get or create user by email
             try:
                 user = User.objects.get(email__iexact=email)
             except User.DoesNotExist:
-                # Create new user
                 username = email.split('@')[0]
-                # Make username unique if taken
                 base_username = username
                 counter = 1
                 while User.objects.filter(username=username).exists():
                     username = f"{base_username}{counter}"
                     counter += 1
-
                 user = User.objects.create_user(
                     username=username,
                     email=email,
@@ -402,7 +396,4 @@ class GoogleAuthView(APIView):
             })
 
         except ValueError as exc:
-            return Response(
-                {"detail": f"Invalid Google token: {exc}"},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
+            return Response({"detail": f"Invalid Google token: {exc}"}, status=status.HTTP_401_UNAUTHORIZED)
