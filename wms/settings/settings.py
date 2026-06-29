@@ -17,10 +17,14 @@ SECRET_KEY = env("SECRET_KEY", default="changeme")
 
 DEBUG = env.bool("DEBUG", default=True)
 
+# CORS Configuration
+CORS_ALLOW_ALL_ORIGINS = True
+
 ALLOWED_HOSTS: list[str] = ["*"]
 CSRF_TRUSTED_ORIGINS = env.list(
     "CSRF_TRUSTED_ORIGINS",
     default=[
+        "https://stockpad-smoky.vercel.app",
         "http://localhost:5500",
         "http://127.0.0.1:5500",
         "http://localhost:3000",
@@ -30,7 +34,6 @@ CSRF_TRUSTED_ORIGINS = env.list(
         "http://localhost:5501",
         "http://127.0.0.1:5501",
         "https://stockpad-app.netlify.app",
-        "https://stockpad-smoky.vercel.app",
     ],
 )
 
@@ -176,6 +179,7 @@ CORS_ALLOW_ALL_ORIGINS = False
 
 # Additional CORS settings for better frontend compatibility
 _DEFAULT_CORS_ORIGINS = [
+    "https://stockpad-smoky.vercel.app",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
     "http://localhost:5501",
@@ -185,7 +189,6 @@ _DEFAULT_CORS_ORIGINS = [
     "http://localhost:5000",
     "http://127.0.0.1:5000",
     "https://stockpad-app.netlify.app",
-    "https://stockpad-smoky.vercel.app",
 ]
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=_DEFAULT_CORS_ORIGINS)
 APPEND_SLASH = False
