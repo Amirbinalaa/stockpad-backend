@@ -30,6 +30,7 @@ CSRF_TRUSTED_ORIGINS = env.list(
         "http://localhost:5501",
         "http://127.0.0.1:5501",
         "https://stockpad-app.netlify.app",
+        "https://stockpad-smoky.vercel.app",
     ],
 )
 
@@ -184,7 +185,7 @@ _DEFAULT_CORS_ORIGINS = [
     "http://localhost:5000",
     "http://127.0.0.1:5000",
     "https://stockpad-app.netlify.app",
-    "https://stockpad-warehouse.vercel.app",
+    "https://stockpad-smoky.vercel.app",
 ]
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=_DEFAULT_CORS_ORIGINS)
 APPEND_SLASH = False
