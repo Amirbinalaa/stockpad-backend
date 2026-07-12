@@ -56,10 +56,11 @@ urlpatterns = [
     path("api/settings/", include("settings_app.urls")),
 ]
 
-from django.views.static import serve
-from django.urls import re_path
+if settings.DEBUG:
+    from django.views.static import serve
+    from django.urls import re_path
 
-urlpatterns += [
-    re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
-]
+    urlpatterns += [
+        re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
+    ]
 

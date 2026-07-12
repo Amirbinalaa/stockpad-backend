@@ -239,23 +239,42 @@ if "test" in sys.argv:
     }
 
 # Cloudinary Configuration for Media Files
-# Safe defaults so a fresh clone without a .env still starts the server.
-# Actual uploads will fail gracefully until real credentials are provided.
+from django.core.exceptions import ImproperlyConfigured
+
 CLOUDINARY_STORAGE = {
     'CLOUD_NAME': env('CLOUDINARY_CLOUD_NAME', default=''),
     'API_KEY': env('CLOUDINARY_API_KEY', default=''),
     'API_SECRET': env('CLOUDINARY_API_SECRET', default=''),
 }
 
-# Use Cloudinary if credentials are provided in the environment, otherwise fallback to local FileSystemStorage
-if (
+# Determine if running in production
+IS_PRODUCTION = (
+    env('DJANGO_ENV', default='') == 'production'
+    or env('ENVIRONMENT', default='') == 'production'
+    or env.get_value('DJANGO_SETTINGS_MODULE', default='').endswith('.production')
+    or not env.bool("DEBUG", default=False)
+)
+IS_TESTING = 'test' in sys.argv
+
+has_cloudinary_creds = bool(
     CLOUDINARY_STORAGE.get('CLOUD_NAME')
     and CLOUDINARY_STORAGE.get('API_KEY')
     and CLOUDINARY_STORAGE.get('API_SECRET')
-):
+)
+
+if IS_PRODUCTION and not IS_TESTING:
+    if not has_cloudinary_creds:
+        raise ImproperlyConfigured(
+            "Cloudinary credentials (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET) "
+            "must be configured in the production environment."
+        )
     DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
 else:
-    DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
+    # Local/testing fallback
+    if has_cloudinary_creds:
+        DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+    else:
+        DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
 
 # NOTE: SECURE_CROSS_ORIGIN_OPENER_POLICY is set to "same-origin-allow-popups"
 # above (line ~229) and must NOT be overridden to None — Google Sign-In popups
