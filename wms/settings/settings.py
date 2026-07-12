@@ -17,22 +17,17 @@ SECRET_KEY = env("SECRET_KEY", default="changeme")
 
 DEBUG = env.bool("DEBUG", default=True)
 
-# CORS Configuration
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS Configuration — explicit allow-list defined below (line ~193)
+# CORS_ALLOW_ALL_ORIGINS is intentionally left unset here; it is set to False below.
 
 ALLOWED_HOSTS: list[str] = ["*"]
 CSRF_TRUSTED_ORIGINS = env.list(
     "CSRF_TRUSTED_ORIGINS",
     default=[
         "https://stockpad-smoky.vercel.app",
+        "https://stockpad-dh6kvtwv9-amirbinalaas-projects.vercel.app",
         "http://localhost:5500",
         "http://127.0.0.1:5500",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5000",
-        "http://127.0.0.1:5000",
-        "http://localhost:5501",
-        "http://127.0.0.1:5501",
         "https://stockpad-app.netlify.app",
     ],
 )
@@ -180,14 +175,9 @@ CORS_ALLOW_ALL_ORIGINS = False
 # Additional CORS settings for better frontend compatibility
 _DEFAULT_CORS_ORIGINS = [
     "https://stockpad-smoky.vercel.app",
+    "https://stockpad-dh6kvtwv9-amirbinalaas-projects.vercel.app",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
-    "http://localhost:5501",
-    "http://127.0.0.1:5501",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5000",
-    "http://127.0.0.1:5000",
     "https://stockpad-app.netlify.app",
 ]
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=_DEFAULT_CORS_ORIGINS)
@@ -242,20 +232,28 @@ if "test" in sys.argv:
     }
 
 # Cloudinary Configuration for Media Files
+# Safe defaults so a fresh clone without a .env still starts the server.
+# Actual uploads will fail gracefully until real credentials are provided.
 CLOUDINARY_STORAGE = {
-    'CLOUD_NAME': env('CLOUDINARY_CLOUD_NAME'),
-    'API_KEY': env('CLOUDINARY_API_KEY'),
-    'API_SECRET': env('CLOUDINARY_API_SECRET'),
+    'CLOUD_NAME': env('CLOUDINARY_CLOUD_NAME', default=''),
+    'API_KEY': env('CLOUDINARY_API_KEY', default=''),
+    'API_SECRET': env('CLOUDINARY_API_SECRET', default=''),
 }
 
 # توجيه الميديا لـ Cloudinary
 DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
 
-SECURE_CROSS_ORIGIN_OPENER_POLICY = None
+# NOTE: SECURE_CROSS_ORIGIN_OPENER_POLICY is set to "same-origin-allow-popups"
+# above (line ~229) and must NOT be overridden to None — Google Sign-In popups
+# require this header to be present on every response.
 
 import os
-if os.environ.get('DJANGO_ENV') != 'production':
-    DEBUG = True
+# Relax SSL security settings in local/dev environments only.
+# DEBUG itself is controlled by:
+#   - development.py  (local:  DEBUG=True)
+#   - production.py   (prod:   DEBUG=env.bool("DEBUG", default=False))
+# This guard only suppresses SSL redirects that would break local HTTP.
+if os.environ.get('DJANGO_ENV') not in ('production', 'staging'):
     SECURE_SSL_REDIRECT = False
     SECURE_PROXY_SSL_HEADER = None
     SESSION_COOKIE_SECURE = False

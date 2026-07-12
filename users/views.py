@@ -48,7 +48,12 @@ def _apply_password_reset(user, new_password: str) -> None:
     if not user.check_password(new_password):
         raise ValueError("Password could not be saved.")
 
-FRONTEND_RESET_BASE = os.environ.get("FRONTEND_RESET_BASE_URL", "http://127.0.0.1:5500").rstrip("/")
+# Production default points to Vercel. Override locally with:
+#   FRONTEND_RESET_BASE_URL=http://127.0.0.1:5500  (in your .env)
+FRONTEND_RESET_BASE = os.environ.get(
+    "FRONTEND_RESET_BASE_URL",
+    "https://stockpad-smoky.vercel.app",
+).rstrip("/")
 
 
 def _blacklist_user_tokens(user):
