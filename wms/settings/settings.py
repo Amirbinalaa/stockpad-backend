@@ -181,6 +181,15 @@ _DEFAULT_CORS_ORIGINS = [
     "https://stockpad-app.netlify.app",
 ]
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=_DEFAULT_CORS_ORIGINS)
+
+# Allow ALL Vercel preview deployments via regex so that new per-commit
+# preview URLs (e.g. stockpad-abc123-user-projects.vercel.app) work
+# automatically without having to update CORS_ALLOWED_ORIGINS each time.
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://stockpad[\w-]*\.vercel\.app$",
+    r"^https://[\w-]+-amirbinalaas-projects\.vercel\.app$",
+]
+
 APPEND_SLASH = False
 
 CORS_ALLOW_CREDENTIALS = True
