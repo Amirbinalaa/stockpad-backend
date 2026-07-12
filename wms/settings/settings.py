@@ -25,10 +25,8 @@ CSRF_TRUSTED_ORIGINS = env.list(
     "CSRF_TRUSTED_ORIGINS",
     default=[
         "https://stockpad-smoky.vercel.app",
-        "https://stockpad-dh6kvtwv9-amirbinalaas-projects.vercel.app",
         "http://localhost:5500",
         "http://127.0.0.1:5500",
-        "https://stockpad-app.netlify.app",
     ],
 )
 
@@ -173,12 +171,12 @@ SPECTACULAR_SETTINGS = {
 CORS_ALLOW_ALL_ORIGINS = False
 
 # Additional CORS settings for better frontend compatibility
+# Static list covers the canonical production URL and local dev.
+# All Vercel preview deployments are covered by CORS_ALLOWED_ORIGIN_REGEXES below.
 _DEFAULT_CORS_ORIGINS = [
     "https://stockpad-smoky.vercel.app",
-    "https://stockpad-dh6kvtwv9-amirbinalaas-projects.vercel.app",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
-    "https://stockpad-app.netlify.app",
 ]
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=_DEFAULT_CORS_ORIGINS)
 
