@@ -139,7 +139,11 @@ class ProfilePictureUploadView(APIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request, *args, **kwargs):
-        image = request.FILES.get("image") or request.FILES.get("file")
+        image = (
+            request.FILES.get("image")
+            or request.FILES.get("file")
+            or request.FILES.get("profile_picture")
+        )
 
         if not image:
             raw_payload = (

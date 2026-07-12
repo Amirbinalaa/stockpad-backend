@@ -32,6 +32,7 @@ CSRF_TRUSTED_ORIGINS = env.list(
 
 INSTALLED_APPS = [
     # Media & Static Storage
+    'cloudinary',
     'cloudinary_storage',
     
     # Django core apps
@@ -41,7 +42,6 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    'cloudinary',
 
     # Third-party apps
     "rest_framework",
@@ -247,8 +247,15 @@ CLOUDINARY_STORAGE = {
     'API_SECRET': env('CLOUDINARY_API_SECRET', default=''),
 }
 
-# توجيه الميديا لـ Cloudinary
-DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+# Use Cloudinary if credentials are provided in the environment, otherwise fallback to local FileSystemStorage
+if (
+    CLOUDINARY_STORAGE.get('CLOUD_NAME')
+    and CLOUDINARY_STORAGE.get('API_KEY')
+    and CLOUDINARY_STORAGE.get('API_SECRET')
+):
+    DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+else:
+    DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
 
 # NOTE: SECURE_CROSS_ORIGIN_OPENER_POLICY is set to "same-origin-allow-popups"
 # above (line ~229) and must NOT be overridden to None — Google Sign-In popups
