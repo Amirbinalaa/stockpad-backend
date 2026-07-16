@@ -1,7 +1,7 @@
 from django.db import transaction as db_transaction
 from rest_framework import serializers
 
-from .models import Material, StockTransaction, MaterialRequest
+from .models import Material, StockTransaction, MaterialRequest, EngineerConnection
 
 
 class MaterialSerializer(serializers.ModelSerializer):
@@ -179,4 +179,49 @@ class MaterialRequestCreateSerializer(serializers.ModelSerializer):
             "reason",
             "webhook_url",
         ]
+
+
+class EngineerConnectionSerializer(serializers.ModelSerializer):
+    # Override to suppress the DRF auto-added UniqueValidator so our
+    # custom create() can handle reactivation of inactive connections.
+    engineer_email = serializers.EmailField(
+        max_length=254,
+        validators=[],   # disable auto UniqueValidator
+    )
+
+    class Meta:
+        model = EngineerConnection
+        fields = ["id", "engineer_email", "is_active", "created_at"]
+        read_only_fields = ["id", "is_active", "created_at"]
+
+    def validate_engineer_email(self, value):
+        if not value:
+            raise serializers.ValidationError("Email is required.")
+        return value.strip().lower()
+
+    @db_transaction.atomic
+    def create(self, validated_data):
+        email = validated_data["engineer_email"]
+        manager = self.context["request"].user
+        
+        # Check if already exists in the system
+        connection = EngineerConnection.objects.filter(engineer_email=email).first()
+        if connection:
+            if connection.is_active:
+                raise serializers.ValidationError(
+                    {"engineer_email": "This email is already connected."}
+                )
+            else:
+                # Reactivate and associate with the current manager
+                connection.manager = manager
+                connection.is_active = True
+                connection.save(update_fields=["manager", "is_active"])
+                return connection
+                
+        return EngineerConnection.objects.create(
+            manager=manager,
+            engineer_email=email,
+            is_active=True
+        )
+
 

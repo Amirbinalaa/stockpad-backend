@@ -141,3 +141,23 @@ class MaterialRequest(models.Model):
 
     def __str__(self) -> str:
         return f"Request for {self.material.name} ({self.status})"
+
+
+class EngineerConnection(models.Model):
+    manager = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="connected_engineers",
+    )
+    engineer_email = models.EmailField(
+        unique=True,
+        help_text="The email of the engineer allowed to access this warehouse.",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.engineer_email} -> {self.manager.username}"

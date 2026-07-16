@@ -14,7 +14,7 @@ import requests
 
 from settings_app.models import UserPreference
 
-from .models import Material, StockTransaction, MaterialRequest
+from .models import Material, StockTransaction, MaterialRequest, EngineerConnection
 from .serializers import (
     MaterialCreateSerializer,
     MaterialSerializer,
@@ -22,6 +22,7 @@ from .serializers import (
     MaterialRequestSerializer,
     MaterialRequestReviewSerializer,
     MaterialRequestCreateSerializer,
+    EngineerConnectionSerializer,
 )
 
 
@@ -288,6 +289,35 @@ class MaterialRequestCreateView(generics.CreateAPIView):
     permission_classes = [HasSiteBAPIKey]
     authentication_classes = []
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        requester_email = serializer.validated_data.get("requester_email")
+        material = serializer.validated_data.get("material")
+
+        manager = material.user if (material and material.user) else None
+        if not manager:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            manager = User.objects.filter(is_superuser=True).first() or User.objects.filter(role="admin").first()
+
+        is_connected = EngineerConnection.objects.filter(
+            manager=manager,
+            engineer_email=requester_email,
+            is_active=True
+        ).exists()
+
+        if not is_connected:
+            return Response(
+                {"error": "Unauthorized. This engineer's email is not connected to the warehouse manager."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
     def perform_create(self, serializer):
         from django.contrib.auth import get_user_model
         User = get_user_model()
@@ -323,6 +353,49 @@ class MaterialRequestCreateView(generics.CreateAPIView):
                 )
             except requests.RequestException:
                 pass
+
+
+class EngineerConnectionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        connections = EngineerConnection.objects.filter(
+            manager=request.user, is_active=True
+        ).select_related('manager')
+        serializer = EngineerConnectionSerializer(connections, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = EngineerConnectionSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def delete(self, request, pk=None):
+        manager = request.user
+        connection = None
+
+        if pk is not None:
+            connection = EngineerConnection.objects.filter(pk=pk, manager=manager).first()
+        else:
+            conn_id = request.query_params.get("id") or request.data.get("id")
+            email = request.query_params.get("email") or request.data.get("email")
+
+            if conn_id:
+                connection = EngineerConnection.objects.filter(pk=conn_id, manager=manager).first()
+            elif email:
+                connection = EngineerConnection.objects.filter(engineer_email=email, manager=manager).first()
+
+        if not connection:
+            return Response(
+                {"error": "Connection not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        connection.is_active = False
+        connection.save(update_fields=["is_active"])
+        return Response({"message": "Access revoked successfully."}, status=status.HTTP_200_OK)
+
 
 
 def _resolve_dead_stock_threshold(user):

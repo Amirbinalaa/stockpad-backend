@@ -11,6 +11,7 @@ from .views import (
     MaterialRequestReviewView,
     MaterialRequestCreateView,
     AIInsightsView,
+    EngineerConnectionView,
 )
 
 
@@ -35,4 +36,8 @@ urlpatterns = [
     path("requests/list/", MaterialRequestListView.as_view(), name="request-list"),
     path("requests/<int:pk>/review/", MaterialRequestReviewView.as_view(), name="request-review"),
     path("requests/create/", MaterialRequestCreateView.as_view(), name="request-create"),
+
+    # Connected Engineers (Team Access Control)
+    path("connections/", EngineerConnectionView.as_view(), name="connections-list"),
+    path("connections/<int:pk>/", EngineerConnectionView.as_view(), name="connections-detail"),
 ]

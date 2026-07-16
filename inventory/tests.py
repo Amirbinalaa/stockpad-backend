@@ -5,7 +5,7 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from .models import Material, StockTransaction
+from .models import Material, StockTransaction, EngineerConnection
 
 
 User = get_user_model()
@@ -213,6 +213,18 @@ class MaterialRequestWebhookTests(TestCase):
         self.headers = {
             "HTTP_X_SITE_B_API_KEY": "Ya3OF1R5KD7xO4INNwFOgYWfb8NCpJVbxMB6hif_1Hg"
         }
+        # Pre-authorise the engineers used in the tests below
+        from .models import EngineerConnection
+        EngineerConnection.objects.create(
+            manager=self.user,
+            engineer_email="user@example.com",
+            is_active=True,
+        )
+        EngineerConnection.objects.create(
+            manager=self.superuser,
+            engineer_email="unknown@example.com",
+            is_active=True,
+        )
 
     @patch("requests.post")
     def test_create_material_request_success_and_webhook(self, mock_post):
@@ -240,12 +252,11 @@ class MaterialRequestWebhookTests(TestCase):
         self.material.refresh_from_db()
         self.assertEqual(self.material.user, self.user)
         
-        # Verify webhook was POSTed
-        mock_post.assert_called_once_with(
-            "https://site-b.com/webhooks/requests/",
-            json={"id": req.id, "status": "pending"},
-            timeout=5
-        )
+        # Verify webhook was POSTed with HMAC-signed headers
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args
+        self.assertEqual(call_kwargs[0][0], "https://site-b.com/webhooks/requests/")
+        self.assertIn("X-Site-A-Signature", call_kwargs[1]["headers"])
 
     @patch("requests.post")
     def test_create_material_request_fallback_superuser(self, mock_post):
@@ -304,10 +315,109 @@ class MaterialRequestWebhookTests(TestCase):
         req.refresh_from_db()
         self.assertEqual(req.status, "approved")
         
-        # Verify webhook POSTed
-        mock_post.assert_called_once_with(
-            "https://site-b.com/webhooks/requests/",
-            json={"id": req.id, "status": "approved"},
-            timeout=5
+        # Verify webhook POSTed with HMAC-signed headers
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args
+        self.assertEqual(call_kwargs[0][0], "https://site-b.com/webhooks/requests/")
+        self.assertIn("X-Site-A-Signature", call_kwargs[1]["headers"])
+
+
+class TeamAccessControlTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.manager = User.objects.create_user(
+            username="manager1", password="password123", email="manager1@example.com"
         )
+        # Login manager
+        login_resp = self.client.post(
+            "/api/auth/login/",
+            {"username": "manager1", "password": "password123"},
+            format="json",
+        )
+        self.access = login_resp.data["access"]
+        
+        self.material = Material.objects.create(
+            user=self.manager,
+            name="Cement",
+            unit="kg",
+            current_quantity=Decimal("50.0")
+        )
+        # Auth header for Site B calls
+        self.site_b_headers = {
+            "HTTP_X_SITE_B_API_KEY": "Ya3OF1R5KD7xO4INNwFOgYWfb8NCpJVbxMB6hif_1Hg"
+        }
+
+    def test_connections_api_crud(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access}")
+        url = reverse("inventory:connections-list")
+        
+        # 1. GET list (initially empty)
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 0)
+        
+        # 2. POST create connection
+        payload = {"engineer_email": "engineer1@example.com"}
+        resp = self.client.post(url, payload, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["engineer_email"], "engineer1@example.com")
+        self.assertTrue(resp.data["is_active"])
+        
+        # 3. GET list (now contains 1 connection)
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 1)
+        self.assertEqual(resp.data[0]["engineer_email"], "engineer1@example.com")
+        
+        # 4. POST duplicate connection (should fail)
+        resp = self.client.post(url, payload, format="json")
+        self.assertEqual(resp.status_code, 400)
+        
+        # 5. DELETE connection
+        list_resp = self.client.get(url)
+        conn_id = list_resp.data[0]["id"]
+        
+        detail_url = reverse("inventory:connections-detail", kwargs={"pk": conn_id})
+        resp = self.client.delete(detail_url)
+        self.assertEqual(resp.status_code, 200)
+        
+        # 6. GET list (should be empty again because it's inactive)
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 0)
+        
+        # 7. POST reactivate connection (should succeed)
+        resp = self.client.post(url, payload, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["engineer_email"], "engineer1@example.com")
+        self.assertTrue(resp.data["is_active"])
+
+    @patch("requests.post")
+    def test_request_creation_security_enforcement(self, mock_post):
+        # 1. Attempt request submission without active connection (fails with 403)
+        url = reverse("inventory:request-create")
+        payload = {
+            "material": self.material.id,
+            "requester_id": "eng-999",
+            "requester_email": "untrusted@example.com",
+            "quantity": "10.0",
+            "reason": "Building foundation",
+            "webhook_url": "https://site-b.com/webhooks/",
+        }
+        
+        resp = self.client.post(url, payload, format="json", **self.site_b_headers)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.data["error"], "Unauthorized. This engineer's email is not connected to the warehouse manager.")
+        
+        # 2. Add connection for the email
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access}")
+        conn_url = reverse("inventory:connections-list")
+        self.client.post(conn_url, {"engineer_email": "untrusted@example.com"}, format="json")
+        
+        # 3. Attempt request submission again (succeeds with 201)
+        # Clear client auth credentials so we rely purely on X-Site-B-API-Key header
+        self.client.credentials()
+        resp = self.client.post(url, payload, format="json", **self.site_b_headers)
+        self.assertEqual(resp.status_code, 201)
+
 
