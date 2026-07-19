@@ -97,11 +97,10 @@ DATABASES = {
     "default": env.db(
         "DATABASE_URL",
         default="postgresql://USER:PASSWORD@HOST:6543/postgres?sslmode=require",
-        engine_options={
-            "options": '-c search_path="WM_site"'
-        }
     )
 }
+
+DATABASES["default"]["OPTIONS"] = {"options": '-c search_path="WM_site"'}
 
 
 
