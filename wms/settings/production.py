@@ -5,14 +5,14 @@ DEBUG = env.bool("DEBUG", default=False)
 
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["stockpad-backend-production.up.railway.app", "127.0.0.1", "localhost"])
 
-# Database — Parse DATABASE_URL from environment
-DATABASES = {
-    "default": dj_database_url.config(
-        default=env("DATABASE_URL"),
-        conn_max_age=600,
-        ssl_require=True
-    )
-}
+# Database — Parse DATABASE_URL from environment, then enforce WM_site schema routing.
+_db = dj_database_url.config(
+    default=env("DATABASE_URL"),
+    conn_max_age=600,
+    ssl_require=True,
+)
+_db.setdefault("OPTIONS", {}).update(WM_SITE_DB_OPTIONS)
+DATABASES = {"default": _db}
 
 # Static files
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"

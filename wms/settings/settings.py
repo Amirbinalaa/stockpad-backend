@@ -93,6 +93,9 @@ TEMPLATES = [
 WSGI_APPLICATION = "wms.wsgi.application"
 ASGI_APPLICATION = "wms.asgi.application"
 
+# WM site PostgreSQL schema — single source of truth for all environments.
+WM_SITE_DB_OPTIONS = {"options": '-c search_path="WM_site"'}
+
 DATABASES = {
     "default": env.db(
         "DATABASE_URL",
@@ -100,7 +103,7 @@ DATABASES = {
     )
 }
 
-DATABASES["default"]["OPTIONS"] = {"options": '-c search_path="WM_site"'}
+DATABASES["default"].setdefault("OPTIONS", {}).update(WM_SITE_DB_OPTIONS)
 
 
 
