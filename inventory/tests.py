@@ -421,3 +421,95 @@ class TeamAccessControlTests(TestCase):
         self.assertEqual(resp.status_code, 201)
 
 
+class EngineerPEApiTests(TestCase):
+    """Site B catalog + connection check endpoints for PE clients."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.manager = User.objects.create_user(
+            username="wmgr",
+            password="pass123456",
+            email="manager@example.com",
+            role="admin",
+        )
+        self.other_manager = User.objects.create_user(
+            username="othermgr",
+            password="pass123456",
+            email="other@example.com",
+            role="admin",
+        )
+        self.material = Material.objects.create(
+            user=self.manager,
+            name="Cement",
+            unit="kg",
+            current_quantity=Decimal("150.00"),
+            max_quantity=Decimal("500.00"),
+            low_stock_threshold_percent=20,
+        )
+        Material.objects.create(
+            user=self.other_manager,
+            name="Hidden Steel",
+            unit="kg",
+            current_quantity=Decimal("999.00"),
+        )
+        EngineerConnection.objects.create(
+            manager=self.manager,
+            engineer_email="engineer@example.com",
+            is_active=True,
+        )
+        self.headers = {
+            "HTTP_X_SITE_B_API_KEY": "Ya3OF1R5KD7xO4INNwFOgYWfb8NCpJVbxMB6hif_1Hg"
+        }
+
+    def test_engineer_connection_check_active(self):
+        url = reverse("inventory:connections-check")
+        resp = self.client.get(url, {"email": "engineer@example.com"}, **self.headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["connected"])
+        self.assertTrue(resp.data["is_active"])
+        self.assertIsNotNone(resp.data["engineer_id"])
+        self.assertEqual(resp.data["engineer_email"], "engineer@example.com")
+
+    def test_engineer_connection_check_not_connected(self):
+        url = reverse("inventory:engineers-status")
+        resp = self.client.get(url, {"email": "unknown@example.com"}, **self.headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data["connected"])
+        self.assertFalse(resp.data["is_active"])
+        self.assertIsNone(resp.data["engineer_id"])
+
+    def test_engineer_catalog_quantity_and_category_fields(self):
+        url = reverse("inventory:engineer-catalog")
+        resp = self.client.get(
+            url, {"email": "engineer@example.com"}, **self.headers
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 1)
+        item = resp.data[0]
+        self.assertEqual(item["name"], "Cement")
+        self.assertEqual(item["quantity"], 150.0)
+        self.assertEqual(item["quantity_available"], 150.0)
+        self.assertEqual(item["current_quantity"], 150.0)
+        self.assertEqual(item["stock_status"], "in_stock")
+        self.assertEqual(item["category_name"], "Raw Materials")
+        self.assertEqual(item["category"]["name"], "Raw Materials")
+
+    def test_engineer_catalog_scoped_to_manager(self):
+        url = reverse("inventory:material-catalog")
+        resp = self.client.get(
+            url, {"email": "engineer@example.com"}, **self.headers
+        )
+        self.assertEqual(resp.status_code, 200)
+        names = [item["name"] for item in resp.data]
+        self.assertIn("Cement", names)
+        self.assertNotIn("Hidden Steel", names)
+
+    def test_engineer_catalog_rejects_unconnected_email(self):
+        url = reverse("inventory:material-catalog")
+        resp = self.client.get(
+            url, {"email": "stranger@example.com"}, **self.headers
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(resp.data["connected"])
+
+

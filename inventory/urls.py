@@ -5,6 +5,7 @@ from .views import (
     MaterialDetailView,
     MaterialListCreateView,
     MaterialCatalogView,
+    EngineerConnectionCheckView,
     ReportView,
     StockTransactionListCreateView,
     MaterialRequestListView,
@@ -31,6 +32,9 @@ urlpatterns = [
     
     # Site B — Public API Key-protected endpoints
     path("materials/catalog/", MaterialCatalogView.as_view(), name="material-catalog"),
+    path("engineer-catalog/", MaterialCatalogView.as_view(), name="engineer-catalog"),
+    path("connections/check/", EngineerConnectionCheckView.as_view(), name="connections-check"),
+    path("engineers/status/", EngineerConnectionCheckView.as_view(), name="engineers-status"),
 
     # Material Requests
     path("requests/list/", MaterialRequestListView.as_view(), name="request-list"),

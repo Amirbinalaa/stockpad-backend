@@ -3,6 +3,57 @@ from rest_framework import serializers
 
 from .models import Material, StockTransaction, MaterialRequest, EngineerConnection
 
+# Unit → PE catalog category (no DB category field on Material)
+_UNIT_CATEGORY_MAP = {
+    Material.UNIT_KG: (1, "Raw Materials"),
+    Material.UNIT_LITER: (2, "Liquids & Chemicals"),
+    Material.UNIT_PCS: (3, "Components & Parts"),
+    Material.UNIT_METER: (4, "Structural Materials"),
+}
+_DEFAULT_CATEGORY = (0, "General Supplies")
+
+
+def normalize_engineer_email(email):
+    return (email or "").strip().lower()
+
+
+def resolve_stock_status(material):
+    qty = float(material.current_quantity or 0)
+    if qty <= 0:
+        return "out_of_stock"
+    threshold_percent = material.low_stock_threshold_percent
+    max_qty = float(material.max_quantity or 0)
+    if threshold_percent and max_qty > 0:
+        threshold_value = max_qty * (float(threshold_percent) / 100.0)
+        if qty <= threshold_value:
+            return "low_stock"
+    return "in_stock"
+
+
+def resolve_material_category(material):
+    cat_id, cat_name = _UNIT_CATEGORY_MAP.get(material.unit, _DEFAULT_CATEGORY)
+    return {"id": cat_id, "name": cat_name}, cat_name
+
+
+def build_engineer_catalog_item(material):
+    """Flat PE-facing catalog payload with quantity aliases and category metadata."""
+    qty = float(material.current_quantity or 0)
+    category, category_name = resolve_material_category(material)
+    return {
+        "id": material.id,
+        "name": material.name,
+        "unit": material.unit,
+        "quantity": qty,
+        "quantity_available": qty,
+        "current_quantity": qty,
+        "stock_status": resolve_stock_status(material),
+        "category_name": category_name,
+        "category": category,
+        "low_stock_threshold_percent": material.low_stock_threshold_percent,
+        "max_quantity": float(material.max_quantity or 0),
+        "is_active": material.is_active,
+    }
+
 
 class MaterialSerializer(serializers.ModelSerializer):
     class Meta:

@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 
 from django.conf import settings
 from django.db import models
@@ -23,7 +24,11 @@ from .serializers import (
     MaterialRequestReviewSerializer,
     MaterialRequestCreateSerializer,
     EngineerConnectionSerializer,
+    build_engineer_catalog_item,
+    normalize_engineer_email,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MaterialListCreateView(generics.ListCreateAPIView):
@@ -162,20 +167,102 @@ def _build_webhook_headers(payload: dict) -> dict:
     }
 
 
-class MaterialCatalogView(generics.ListAPIView):
+class MaterialCatalogView(APIView):
     """
-    Read-only materials catalog for Site B.
-    Returns id, name, unit, and current_quantity for all active materials.
-    Protected by the same X-Site-B-API-Key used for request creation.
+    Read-only materials catalog for Site B (PE).
+    Accepts ?email= or ?engineer_email= to scope inventory to the connected manager.
+    Protected by X-Site-B-API-Key.
     """
     permission_classes = [HasSiteBAPIKey]
     authentication_classes = []
 
     def get(self, request, *args, **kwargs):
-        materials = Material.objects.filter(is_active=True).order_by("name").values(
-            "id", "name", "unit", "current_quantity"
+        raw_email = (
+            request.query_params.get("email")
+            or request.query_params.get("engineer_email")
         )
-        return Response(list(materials))
+        email = normalize_engineer_email(raw_email)
+        logger.info("[WM API] Engineer Email Queried: %s", email or "(none)")
+
+        materials_qs = Material.objects.filter(is_active=True)
+
+        if email:
+            connection = (
+                EngineerConnection.objects.filter(
+                    engineer_email__iexact=email,
+                    is_active=True,
+                )
+                .select_related("manager")
+                .first()
+            )
+            if not connection:
+                logger.info(
+                    "[WM API] Catalog Payload Sent: 0 items (engineer not connected: %s)",
+                    email,
+                )
+                return Response(
+                    {
+                        "error": (
+                            "Unauthorized. This engineer's email is not connected "
+                            "to the warehouse manager."
+                        ),
+                        "connected": False,
+                        "results": [],
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            materials_qs = materials_qs.filter(user=connection.manager)
+
+        payload = [
+            build_engineer_catalog_item(m)
+            for m in materials_qs.select_related("user").order_by("name")
+        ]
+        logger.info(
+            "[WM API] Catalog Payload Sent: %d items for engineer %s",
+            len(payload),
+            email or "all",
+        )
+        return Response(payload)
+
+
+class EngineerConnectionCheckView(APIView):
+    """
+    Site B connection probe — verifies an engineer email is active on WM.
+    GET ?email=engineer@example.com
+    """
+    permission_classes = [HasSiteBAPIKey]
+    authentication_classes = []
+
+    def get(self, request, *args, **kwargs):
+        raw_email = (
+            request.query_params.get("email")
+            or request.query_params.get("engineer_email")
+        )
+        email = normalize_engineer_email(raw_email)
+        logger.info("[WM API] Engineer Email Queried: %s", email or "(missing)")
+
+        if not email:
+            return Response(
+                {"error": "Query parameter 'email' (or 'engineer_email') is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        connection = (
+            EngineerConnection.objects.filter(engineer_email__iexact=email)
+            .select_related("manager")
+            .first()
+        )
+
+        is_active = bool(connection and connection.is_active)
+        result = {
+            "connected": is_active,
+            "is_active": is_active,
+            "engineer_id": connection.id if connection else None,
+            "engineer_email": email,
+            "manager_id": connection.manager_id if connection and is_active else None,
+        }
+        logger.info("[WM API] Connection Status Result: %s", result)
+        return Response(result)
 
 
 class MaterialRequestListView(generics.ListAPIView):
@@ -293,7 +380,9 @@ class MaterialRequestCreateView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        requester_email = serializer.validated_data.get("requester_email")
+        requester_email = normalize_engineer_email(
+            serializer.validated_data.get("requester_email")
+        )
         material = serializer.validated_data.get("material")
 
         manager = material.user if (material and material.user) else None
@@ -304,7 +393,7 @@ class MaterialRequestCreateView(generics.CreateAPIView):
 
         is_connected = EngineerConnection.objects.filter(
             manager=manager,
-            engineer_email=requester_email,
+            engineer_email__iexact=requester_email,
             is_active=True
         ).exists()
 
