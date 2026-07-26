@@ -329,13 +329,24 @@ if IS_PRODUCTION and not IS_TESTING:
             "Cloudinary credentials (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET) "
             "must be configured in the production environment."
         )
-    DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+    default_storage_backend = 'cloudinary_storage.storage.MediaCloudinaryStorage'
 else:
     # Local/testing fallback
     if has_cloudinary_creds:
-        DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+        default_storage_backend = 'cloudinary_storage.storage.MediaCloudinaryStorage'
     else:
-        DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
+        default_storage_backend = 'django.core.files.storage.FileSystemStorage'
+
+DEFAULT_FILE_STORAGE = default_storage_backend
+
+STORAGES = {
+    "default": {
+        "BACKEND": default_storage_backend,
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 
 # NOTE: SECURE_CROSS_ORIGIN_OPENER_POLICY is set to "same-origin-allow-popups"
 # above (line ~229) and must NOT be overridden to None — Google Sign-In popups
