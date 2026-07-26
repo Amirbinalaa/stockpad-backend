@@ -155,8 +155,56 @@ REST_FRAMEWORK = {
         "rest_framework.filters.OrderingFilter",
         "rest_framework.filters.SearchFilter",
     ),
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "100/day",
+        "user": "1000/day",
+        "site_b_catalog": "60/minute",
+        "site_b_request_create": "30/minute",
+    },
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
+
+# Celery & Redis Task Queue Configuration
+CELERY_BROKER_URL = env("REDIS_URL", default="redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = env("REDIS_URL", default="redis://localhost:6379/0")
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = TIME_ZONE
+
+import sys
+if "test" in sys.argv or getattr(sys, "_called_from_test", False):
+    CELERY_TASK_ALWAYS_EAGER = True
+    CELERY_TASK_EAGER_PROPAGATES = True
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": env("REDIS_URL", default="redis://localhost:6379/0"),
+        }
+    }
+
+CELERY_BEAT_SCHEDULE = {
+    "recompute-ai-insights-hourly": {
+        "task": "inventory.tasks.recompute_ai_insights_task",
+        "schedule": 3600.0,
+    },
+    # Phase 5: check for webhook retry spikes every 15 minutes
+    "check-webhook-retry-spike-every-15min": {
+        "task": "inventory.tasks.check_webhook_retry_spike",
+        "schedule": 900.0,
+    },
+}
+
+# Phase 5: Webhook Retry Spike Alerting
+# Fires a CRITICAL log when rolling 1-hour retry count reaches this value.
+WEBHOOK_RETRY_SPIKE_THRESHOLD = env.int("WEBHOOK_RETRY_SPIKE_THRESHOLD", default=5)
+
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(hours=1),
@@ -232,6 +280,14 @@ SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin-allow-popups"
 SECURE_CROSS_ORIGIN_EMBEDDER_POLICY = "unsafe-none"
 
 SITE_B_API_KEY = env("SITE_B_API_KEY", default="")
+
+# Phase 5 — Key rotation transition window.
+# During a rotation, populate *_NEW while keeping the old key active.
+# Once Site B has switched to the new key, blank out the old one.
+# Site A accepts BOTH keys during the overlap window (see HasSiteBAPIKey permission).
+# SITE_A_API_KEY_NEW is used for outbound HMAC signing on webhook delivery.
+SITE_A_API_KEY_NEW = env("SITE_A_API_KEY_NEW", default="")
+SITE_B_API_KEY_NEW = env("SITE_B_API_KEY_NEW", default="")
 
 
 import sys

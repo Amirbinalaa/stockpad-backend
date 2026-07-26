@@ -197,6 +197,7 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
             "reviewed_by",
             "created_at",
             "updated_at",
+            "idempotency_key",
         ]
 
 
@@ -229,7 +230,11 @@ class MaterialRequestCreateSerializer(serializers.ModelSerializer):
             "quantity",
             "reason",
             "webhook_url",
+            "idempotency_key",
         ]
+        extra_kwargs = {
+            "idempotency_key": {"required": False, "allow_null": True},
+        }
 
 
 class EngineerConnectionSerializer(serializers.ModelSerializer):

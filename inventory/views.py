@@ -2,13 +2,14 @@ import hashlib
 import hmac
 import json
 import logging
+import uuid
 
 from django.conf import settings
 from django.db import models
 from django.db import transaction as db_transaction
 from django.db.models import Sum
 from django.utils import timezone
-from rest_framework import generics, permissions, status
+from rest_framework import generics, permissions, status, pagination, throttling
 from rest_framework.response import Response
 from rest_framework.views import APIView
 import requests
@@ -16,6 +17,7 @@ import requests
 from settings_app.models import UserPreference
 
 from .models import Material, StockTransaction, MaterialRequest, EngineerConnection
+from .tasks import dispatch_webhook_async
 from .serializers import (
     MaterialCreateSerializer,
     MaterialSerializer,
@@ -29,6 +31,28 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class StandardResultsSetPagination(pagination.PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class SiteBCatalogRateThrottle(throttling.SimpleRateThrottle):
+    scope = "site_b_catalog"
+
+    def get_cache_key(self, request, view):
+        ident = self.get_ident(request)
+        return f"throttle_site_b_catalog_{ident}"
+
+
+class SiteBRequestCreateRateThrottle(throttling.SimpleRateThrottle):
+    scope = "site_b_request_create"
+
+    def get_cache_key(self, request, view):
+        ident = self.get_ident(request)
+        return f"throttle_site_b_request_{ident}"
 
 
 class MaterialListCreateView(generics.ListCreateAPIView):
@@ -127,7 +151,6 @@ class ReportView(APIView):
         elif period == "specific" and specific_date:
             qs = qs.filter(created_at__date=specific_date)
 
-        serializer = StockTransactionSerializer(qs, many=True)
         totals = qs.aggregate(
             total_in=Sum("quantity", filter=models.Q(type=StockTransaction.TYPE_IN)),
             total_out=Sum("quantity", filter=models.Q(type=StockTransaction.TYPE_OUT)),
@@ -138,6 +161,20 @@ class ReportView(APIView):
             "net": (totals["total_in"] or 0) - (totals["total_out"] or 0),
             "count": qs.count(),
         }
+
+        paginator = StandardResultsSetPagination()
+        page = paginator.paginate_queryset(qs, request)
+        if page is not None:
+            serializer = StockTransactionSerializer(page, many=True)
+            return Response({
+                "summary": summary,
+                "count": paginator.page.paginator.count,
+                "next": paginator.get_next_link(),
+                "previous": paginator.get_previous_link(),
+                "results": serializer.data,
+            })
+
+        serializer = StockTransactionSerializer(qs, many=True)
         return Response({"summary": summary, "results": serializer.data})
 
 
@@ -146,19 +183,28 @@ class ReportView(APIView):
 class HasSiteBAPIKey(permissions.BasePermission):
     """
     Custom permission to allow requests from Site B using an API Key.
+    Phase 5 — rotation support: during a key rotation window, both
+    SITE_B_API_KEY (old) and SITE_B_API_KEY_NEW (new) are accepted.
+    Once Site B has fully switched to the new key, clear SITE_B_API_KEY.
     """
     def has_permission(self, request, view):
         api_key = request.headers.get("X-Site-B-API-Key")
-        expected_key = getattr(settings, "SITE_B_API_KEY", None)
-        return api_key == expected_key
+        old_key = getattr(settings, "SITE_B_API_KEY", None)
+        new_key = getattr(settings, "SITE_B_API_KEY_NEW", None) or None
+        accepted_keys = {k for k in [old_key, new_key] if k}
+        return bool(api_key and api_key in accepted_keys)
 
 
 def _build_webhook_headers(payload: dict) -> dict:
     """
     Serialize payload to JSON bytes and compute an HMAC-SHA256 signature
     using SITE_A_API_KEY. Returns headers dict ready to pass to requests.post().
+    Phase 5 — rotation support: if SITE_A_API_KEY_NEW is set, sign with the
+    new key so Site B can begin validating it ahead of the cutover.
     """
-    secret = getattr(settings, "SITE_A_API_KEY", "").encode("utf-8")
+    new_secret = getattr(settings, "SITE_A_API_KEY_NEW", "") or ""
+    old_secret = getattr(settings, "SITE_A_API_KEY", "") or ""
+    secret = (new_secret or old_secret).encode("utf-8")
     body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     signature = hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
     return {
@@ -167,13 +213,36 @@ def _build_webhook_headers(payload: dict) -> dict:
     }
 
 
+def get_catalog_cache_version():
+    try:
+        from django.core.cache import cache
+        return cache.get("catalog_cache_version", 1)
+    except Exception:
+        return 1
+
+
+def invalidate_catalog_cache():
+    """
+    Invalidates the catalog cache by incrementing catalog cache version.
+    Catches any cache/Redis exceptions gracefully.
+    """
+    try:
+        from django.core.cache import cache
+        version = cache.get("catalog_cache_version", 1)
+        cache.set("catalog_cache_version", version + 1, timeout=None)
+        logger.info("[WM Cache] Incremented catalog_cache_version to %d", version + 1)
+    except Exception as exc:
+        logger.warning("[WM Cache] Failed to invalidate catalog cache: %s", exc)
+
+
 class MaterialCatalogView(APIView):
     """
     Read-only materials catalog for Site B (PE).
     Accepts ?email= or ?engineer_email= to scope inventory to the connected manager.
-    Protected by X-Site-B-API-Key.
+    Protected by X-Site-B-API-Key and rate-limited. Cached in Redis/locmem.
     """
     permission_classes = [HasSiteBAPIKey]
+    throttle_classes = [SiteBCatalogRateThrottle]
     authentication_classes = []
 
     def get(self, request, *args, **kwargs):
@@ -183,6 +252,22 @@ class MaterialCatalogView(APIView):
         )
         email = normalize_engineer_email(raw_email)
         logger.info("[WM API] Engineer Email Queried: %s", email or "(none)")
+
+        version = get_catalog_cache_version()
+        cache_key = f"catalog_payload_v{version}_{email}" if email else f"catalog_payload_v{version}_all"
+
+        try:
+            from django.core.cache import cache
+            cached_payload = cache.get(cache_key)
+            if cached_payload is not None:
+                logger.info(
+                    "[WM API] Catalog Payload Served from Cache (key=%s): %d items",
+                    cache_key,
+                    len(cached_payload),
+                )
+                return Response(cached_payload)
+        except Exception as exc:
+            logger.warning("[WM Cache] Redis GET failed for catalog key %s: %s", cache_key, exc)
 
         materials_qs = Material.objects.filter(is_active=True)
 
@@ -217,12 +302,20 @@ class MaterialCatalogView(APIView):
             build_engineer_catalog_item(m)
             for m in materials_qs.select_related("user").order_by("name")
         ]
+
+        try:
+            from django.core.cache import cache
+            cache.set(cache_key, payload, timeout=300)
+        except Exception as exc:
+            logger.warning("[WM Cache] Redis SET failed for catalog key %s: %s", cache_key, exc)
+
         logger.info(
-            "[WM API] Catalog Payload Sent: %d items for engineer %s",
+            "[WM API] Catalog Payload Sent & Cached: %d items for engineer %s",
             len(payload),
             email or "all",
         )
         return Response(payload)
+
 
 
 class EngineerConnectionCheckView(APIView):
@@ -268,6 +361,7 @@ class EngineerConnectionCheckView(APIView):
 class MaterialRequestListView(generics.ListAPIView):
     serializer_class = MaterialRequestSerializer
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
 
     def get_queryset(self):
         queryset = MaterialRequest.objects.filter(
@@ -344,21 +438,15 @@ class MaterialRequestReviewView(generics.UpdateAPIView):
             instance.updated_at = timezone.now()
             instance.save(update_fields=["status", "review_notes", "reviewed_by", "updated_at"])
 
-        # Trigger webhook AFTER transaction block commits to prevent blocking db transaction locks
+        # Trigger webhook asynchronously off the request/response cycle
+        # event_id is a stable UUID per review event — Site B uses it for deduplication
         if instance.webhook_url and new_status in [MaterialRequest.STATUS_APPROVED, MaterialRequest.STATUS_DENIED]:
             payload = {
                 "id": instance.id,
                 "status": instance.status,
+                "event_id": str(uuid.uuid4()),
             }
-            try:
-                requests.post(
-                    instance.webhook_url,
-                    data=json.dumps(payload, separators=(",", ":")),
-                    headers=_build_webhook_headers(payload),
-                    timeout=5,
-                )
-            except requests.RequestException:
-                pass
+            dispatch_webhook_async(instance.webhook_url, payload)
 
         return Response(
             MaterialRequestSerializer(instance).data,
@@ -370,15 +458,30 @@ class MaterialRequestCreateView(generics.CreateAPIView):
     """
     Endpoint for Site B (Production Engineer) to submit requests.
     Uses API Key authentication instead of User session.
+    Protected by rate limiting.
     """
     queryset = MaterialRequest.objects.all()
     serializer_class = MaterialRequestCreateSerializer
     permission_classes = [HasSiteBAPIKey]
+    throttle_classes = [SiteBRequestCreateRateThrottle]
     authentication_classes = []
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        # ── Idempotency deduplication ──────────────────────────────────────
+        idempotency_key = serializer.validated_data.get("idempotency_key")
+        if idempotency_key:
+            existing = MaterialRequest.objects.filter(idempotency_key=idempotency_key).first()
+            if existing:
+                logger.info(
+                    "[WM Idempotency] Duplicate submission detected for key=%s — returning existing request id=%s",
+                    idempotency_key,
+                    existing.id,
+                )
+                return Response(MaterialRequestSerializer(existing).data, status=status.HTTP_200_OK)
+        # ──────────────────────────────────────────────────────────────────
 
         requester_email = normalize_engineer_email(
             serializer.validated_data.get("requester_email")
@@ -427,21 +530,15 @@ class MaterialRequestCreateView(generics.CreateAPIView):
         # Save request instance
         instance = serializer.save()
 
-        # Webhook trigger: POST local id and status back to Site B
+        # Webhook trigger: POST local id and status back to Site B asynchronously
+        # event_id is a stable UUID per creation event — Site B uses it for deduplication
         if instance.webhook_url:
             payload = {
                 "id": instance.id,
                 "status": instance.status,
+                "event_id": str(uuid.uuid4()),
             }
-            try:
-                requests.post(
-                    instance.webhook_url,
-                    data=json.dumps(payload, separators=(",", ":")),
-                    headers=_build_webhook_headers(payload),
-                    timeout=5,
-                )
-            except requests.RequestException:
-                pass
+            dispatch_webhook_async(instance.webhook_url, payload)
 
 
 class EngineerConnectionView(APIView):
@@ -577,322 +674,355 @@ def _build_weekly_out_totals(user, weeks=12):
     return totals
 
 
+def compute_ai_insights_for_user(user):
+    """
+    Computes deadstock alerts, demand predictions, throughput metrics,
+    and forecast charts for a specific user without caching.
+    """
+    threshold_days, threshold_value, threshold_unit = _resolve_dead_stock_threshold(user)
+
+    materials = Material.objects.filter(user=user, is_active=True)
+    now = timezone.now()
+    cutoff = now - timezone.timedelta(days=threshold_days)
+    day_30 = now - timezone.timedelta(days=30)
+    day_60 = now - timezone.timedelta(days=60)
+    day_90 = now - timezone.timedelta(days=90)
+
+    deadstock_list = []
+    predictions_list = []
+
+    for m in materials:
+        # --- Dead Stock: qty > 0 and zero OUT transactions inside threshold window ---
+        if float(m.current_quantity or 0) <= 0:
+            pass
+        else:
+            has_out_in_window = m.transactions.filter(
+                type=StockTransaction.TYPE_OUT,
+                created_at__gte=cutoff,
+            ).exists()
+
+            if not has_out_in_window:
+                latest_out = (
+                    m.transactions.filter(type=StockTransaction.TYPE_OUT)
+                    .order_by("-created_at")
+                    .first()
+                )
+                if latest_out and latest_out.created_at:
+                    inactive_since = latest_out.created_at
+                elif m.created_at:
+                    inactive_since = m.created_at
+                else:
+                    inactive_since = now - timezone.timedelta(days=threshold_days)
+
+                delta = now - inactive_since
+                days_inactive = int(delta.total_seconds() // 86400)
+
+                if days_inactive < threshold_days:
+                    continue
+
+                qty = float(m.current_quantity)
+                unit_cost = float(m.cost_price or 0)
+                capital_tied = qty * unit_cost
+
+                deadstock_list.append({
+                    "material_id": m.id,
+                    "sku": f"SKU-{m.id:04d}",
+                    "material_name": m.name,
+                    "last_out_date": (
+                        latest_out.created_at.isoformat()
+                        if latest_out and latest_out.created_at
+                        else None
+                    ),
+                    "created_at": (
+                        m.created_at.isoformat() if m.created_at else None
+                    ),
+                    "days_inactive": days_inactive,
+                    "threshold_days": threshold_days,
+                    "threshold_value": threshold_value,
+                    "threshold_unit": threshold_unit,
+                    "current_quantity": qty,
+                    "cost_price": unit_cost,
+                    "currency": m.currency,
+                    "costing_method": m.costing_method,
+                    "capital_tied": capital_tied,
+                    "estimated_value": capital_tied,
+                    "action_badge": (
+                        "LIQUIDATE"
+                        if days_inactive >= int(threshold_days * 1.5)
+                        else "RELOCATE"
+                    ),
+                    "unit": m.unit,
+                })
+
+        # --- Demand Prediction Logic ---
+        transactions_out = list(m.transactions.filter(type=StockTransaction.TYPE_OUT, created_at__gte=day_90))
+        
+        qty_30 = sum(t.quantity for t in transactions_out if t.created_at and t.created_at >= day_30)
+        qty_60 = sum(t.quantity for t in transactions_out if t.created_at and day_30 > t.created_at >= day_60)
+        qty_90 = sum(t.quantity for t in transactions_out if t.created_at and day_60 > t.created_at >= day_90)
+
+        adc_30 = float(qty_30) / 30.0
+        adc_60 = float(qty_60) / 30.0
+        adc_90 = float(qty_90) / 30.0
+
+        prior_avg = (adc_60 + adc_90) / 2.0
+
+        if prior_avg > 0:
+            change_pct = ((adc_30 - prior_avg) / prior_avg) * 100.0
+        else:
+            change_pct = 100.0 if adc_30 > 0 else 0.0
+
+        sku = f"SKU-{m.id:04d}"
+        product_name = m.name
+
+        if change_pct >= 10.0:
+            status_label = "increasing"
+            message = (
+                f"Demand for {sku} ({product_name}) has increased by "
+                f"{change_pct:.1f}% compared to prior averages."
+            )
+        elif change_pct <= -10.0:
+            status_label = "decreasing"
+            message = (
+                f"Demand for {sku} ({product_name}) has decreased by "
+                f"{abs(change_pct):.1f}% compared to prior averages."
+            )
+        else:
+            status_label = "stable"
+            message = (
+                f"Demand for {sku} ({product_name}) remains stable "
+                f"compared to prior averages."
+            )
+
+        predictions_list.append({
+            "material_id": m.id,
+            "sku": sku,
+            "material_name": product_name,
+            "product_name": product_name,
+            "adc_30": adc_30,
+            "prior_avg": prior_avg,
+            "change_pct": change_pct,
+            "status": status_label,
+            "message": message,
+            "current_quantity": float(m.current_quantity) if m.current_quantity is not None else 0.0,
+            "max_quantity": float(m.max_quantity or 100),
+            "unit": m.unit,
+            "low_stock_threshold_percent": m.low_stock_threshold_percent or 30,
+        })
+
+    materials_list = list(materials)
+    active_count = len(materials_list) or 1
+
+    predicted_throughput = sum(p["adc_30"] * 30 for p in predictions_list)
+    prior_throughput = sum(p["prior_avg"] * 30 for p in predictions_list)
+    if prior_throughput > 0:
+        throughput_trend_pct = (
+            (predicted_throughput - prior_throughput) / prior_throughput
+        ) * 100.0
+    else:
+        throughput_trend_pct = 100.0 if predicted_throughput > 0 else 0.0
+
+    critical_skus = 0
+    for m in materials_list:
+        max_qty = float(m.max_quantity or 100)
+        if max_qty <= 0:
+            continue
+        percent = (float(m.current_quantity) / max_qty) * 100.0
+        threshold = m.low_stock_threshold_percent or 30
+        if percent <= threshold:
+            critical_skus += 1
+
+    est_stockout_risk = (critical_skus / active_count) * 100.0
+
+    dead_stock_value, dead_stock_by_currency, dead_stock_breakdown = (
+        _aggregate_deadstock_capital(deadstock_list)
+    )
+
+    accuracy_samples = []
+    week_ago = now - timezone.timedelta(days=7)
+    for p in predictions_list:
+        predicted_week = p["adc_30"] * 7
+        actual_week = float(
+            StockTransaction.objects.filter(
+                material_id=p["material_id"],
+                type=StockTransaction.TYPE_OUT,
+                created_at__gte=week_ago,
+            ).aggregate(total=Sum("quantity"))["total"]
+            or 0
+        )
+        if predicted_week <= 0 and actual_week <= 0:
+            accuracy_samples.append(100.0)
+            continue
+        denom = max(actual_week, predicted_week, 1.0)
+        error_ratio = abs(predicted_week - actual_week) / denom
+        accuracy_samples.append(max(0.0, 100.0 - (error_ratio * 100.0)))
+
+    ai_accuracy_rate = (
+        sum(accuracy_samples) / len(accuracy_samples)
+        if accuracy_samples
+        else 94.0
+    )
+
+    weekly_out = _build_weekly_out_totals(user, weeks=12)
+    throughput_weekly = [
+        sum(
+            p["adc_30"] * 7
+            * (1 + (p["change_pct"] / 100.0) * (idx / 11))
+            for p in predictions_list
+        )
+        for idx in range(12)
+    ]
+
+    forecast_weeks = 13
+    demand_forecast_points = []
+    for w in range(forecast_weeks):
+        week_total = 0.0
+        for p in predictions_list:
+            growth = 1 + (p["change_pct"] / 100.0) * (w / max(forecast_weeks - 1, 1))
+            week_total += max(p["adc_30"] * 7 * growth, 0)
+        point_date = (now + timezone.timedelta(weeks=w)).date().isoformat()
+        demand_forecast_points.append({
+            "label": f"W{w + 1}",
+            "date": point_date,
+            "value": round(week_total, 2),
+        })
+
+    baseline_points = []
+    for i, val in enumerate(weekly_out[-len(demand_forecast_points):]):
+        baseline_points.append({
+            "label": demand_forecast_points[i]["label"],
+            "date": demand_forecast_points[i]["date"],
+            "value": round(val, 2),
+        })
+    if len(baseline_points) < len(demand_forecast_points):
+        baseline_points = [
+            {"label": p["label"], "date": p["date"], "value": round(p["value"] * 0.85, 2)}
+            for p in demand_forecast_points
+        ]
+
+    seasonality_points = []
+    for idx, val in enumerate(weekly_out):
+        seasonality_points.append({
+            "label": f"W{idx + 1}",
+            "date": (now - timezone.timedelta(weeks=12 - idx)).date().isoformat(),
+            "value": round(val, 2),
+        })
+
+    def _peak_point(points, predictions_src):
+        if not points:
+            return None
+        peak = max(points, key=lambda x: x["value"])
+        top_pred = max(predictions_src, key=lambda x: x["change_pct"], default=None)
+        mid = top_pred["material_id"] if top_pred else None
+        return {
+            "material_name": top_pred["material_name"] if top_pred else "Portfolio",
+            "sku": f"SKU-{mid:04d}" if mid else "PORTFOLIO",
+            "peak_date": peak["date"],
+            "required_capacity": round(peak["value"], 1),
+            "label": peak["label"],
+        }
+
+    forecast_peak = _peak_point(demand_forecast_points, predictions_list)
+    seasonality_peak = _peak_point(seasonality_points, predictions_list)
+
+    if ai_accuracy_rate >= 97:
+        accuracy_tier = "PLATINUM"
+    elif ai_accuracy_rate >= 90:
+        accuracy_tier = "GOLD"
+    elif ai_accuracy_rate >= 80:
+        accuracy_tier = "SILVER"
+    else:
+        accuracy_tier = "CALIBRATING"
+
+    if dead_stock_value > 15000:
+        dead_stock_tier = "HIGH"
+    elif dead_stock_value > 0:
+        dead_stock_tier = "MEDIUM"
+    else:
+        dead_stock_tier = "NONE"
+
+    return {
+        "deadstock": deadstock_list,
+        "dead_stock": deadstock_list,
+        "predictions": predictions_list,
+        "threshold_days": threshold_days,
+        "threshold_value": threshold_value,
+        "threshold_unit": threshold_unit,
+        "metrics": {
+            "predicted_throughput": round(predicted_throughput, 1),
+            "throughput_trend_pct": round(throughput_trend_pct, 1),
+            "throughput_sparkline": _normalize_sparkline(throughput_weekly[-5:]),
+            "est_stockout_risk": round(est_stockout_risk, 1),
+            "critical_sku_count": critical_skus,
+            "stockout_bar_pct": round(est_stockout_risk, 1),
+            "dead_stock_value": round(dead_stock_value, 2),
+            "dead_stock_value_egp": round(dead_stock_value, 2),
+            "dead_stock_by_currency": {
+                k: round(v, 2) for k, v in dead_stock_by_currency.items()
+            },
+            "dead_stock_value_breakdown": dead_stock_breakdown,
+            "dead_stock_base_currency": BASE_CURRENCY,
+            "dead_stock_tier": dead_stock_tier,
+            "dead_stock_sparkline": _normalize_sparkline(
+                [item["current_quantity"] for item in deadstock_list] or [0]
+            ),
+            "ai_accuracy_rate": round(ai_accuracy_rate, 1),
+            "accuracy_bar_pct": round(ai_accuracy_rate, 1),
+            "accuracy_tier": accuracy_tier,
+            "accuracy_sparkline": _normalize_sparkline(accuracy_samples),
+            "dead_stock_bar_pct": round(
+                min(100.0, (dead_stock_value / 15000.0) * 100.0) if dead_stock_value else 0.0,
+                1,
+            ),
+        },
+        "charts": {
+            "demand_forecast": {
+                "points": demand_forecast_points,
+                "baseline": baseline_points,
+                "peak": forecast_peak,
+            },
+            "seasonality_trend": {
+                "points": seasonality_points,
+                "baseline": [],
+                "peak": seasonality_peak,
+            },
+        },
+    }
+
+
+def get_or_compute_ai_insights(user):
+    """
+    Attempts to fetch AI insights from cache (Redis/locmem) for user.
+    Computes and caches data on cache miss.
+    """
+    cache_key = f"ai_insights_user_{user.id}"
+    try:
+        from django.core.cache import cache
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.info("[WM API] Serving AI insights for user %s from cache", user.id)
+            return cached
+    except Exception as exc:
+        logger.warning("[WM Cache] Redis GET failed for AI insights key %s: %s", cache_key, exc)
+
+    data = compute_ai_insights_for_user(user)
+
+    try:
+        from django.core.cache import cache
+        cache.set(cache_key, data, timeout=86400)
+    except Exception as exc:
+        logger.warning("[WM Cache] Redis SET failed for AI insights key %s: %s", cache_key, exc)
+
+    return data
+
+
 class AIInsightsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
         try:
-            threshold_days, threshold_value, threshold_unit = _resolve_dead_stock_threshold(
-                request.user
-            )
-
-            materials = Material.objects.filter(user=request.user, is_active=True)
-            now = timezone.now()
-            cutoff = now - timezone.timedelta(days=threshold_days)
-            day_30 = now - timezone.timedelta(days=30)
-            day_60 = now - timezone.timedelta(days=60)
-            day_90 = now - timezone.timedelta(days=90)
-
-            deadstock_list = []
-            predictions_list = []
-
-            for m in materials:
-                # --- Dead Stock: qty > 0 and zero OUT transactions inside threshold window ---
-                if float(m.current_quantity or 0) <= 0:
-                    pass
-                else:
-                    has_out_in_window = m.transactions.filter(
-                        type=StockTransaction.TYPE_OUT,
-                        created_at__gte=cutoff,
-                    ).exists()
-
-                    if not has_out_in_window:
-                        latest_out = (
-                            m.transactions.filter(type=StockTransaction.TYPE_OUT)
-                            .order_by("-created_at")
-                            .first()
-                        )
-                        if latest_out and latest_out.created_at:
-                            inactive_since = latest_out.created_at
-                        elif m.created_at:
-                            inactive_since = m.created_at
-                        else:
-                            inactive_since = now - timezone.timedelta(days=threshold_days)
-
-                        delta = now - inactive_since
-                        days_inactive = int(delta.total_seconds() // 86400)
-
-                        if days_inactive < threshold_days:
-                            continue
-
-                        qty = float(m.current_quantity)
-                        unit_cost = float(m.cost_price or 0)
-                        capital_tied = qty * unit_cost
-
-                        deadstock_list.append({
-                            "material_id": m.id,
-                            "sku": f"SKU-{m.id:04d}",
-                            "material_name": m.name,
-                            "last_out_date": (
-                                latest_out.created_at.isoformat()
-                                if latest_out and latest_out.created_at
-                                else None
-                            ),
-                            "created_at": (
-                                m.created_at.isoformat() if m.created_at else None
-                            ),
-                            "days_inactive": days_inactive,
-                            "threshold_days": threshold_days,
-                            "threshold_value": threshold_value,
-                            "threshold_unit": threshold_unit,
-                            "current_quantity": qty,
-                            "cost_price": unit_cost,
-                            "currency": m.currency,
-                            "costing_method": m.costing_method,
-                            "capital_tied": capital_tied,
-                            "estimated_value": capital_tied,
-                            "action_badge": (
-                                "LIQUIDATE"
-                                if days_inactive >= int(threshold_days * 1.5)
-                                else "RELOCATE"
-                            ),
-                            "unit": m.unit,
-                        })
-
-                # --- Demand Prediction Logic ---
-                transactions_out = list(m.transactions.filter(type=StockTransaction.TYPE_OUT, created_at__gte=day_90))
-                
-                qty_30 = sum(t.quantity for t in transactions_out if t.created_at and t.created_at >= day_30)
-                qty_60 = sum(t.quantity for t in transactions_out if t.created_at and day_30 > t.created_at >= day_60)
-                qty_90 = sum(t.quantity for t in transactions_out if t.created_at and day_60 > t.created_at >= day_90)
-
-                adc_30 = float(qty_30) / 30.0
-                adc_60 = float(qty_60) / 30.0
-                adc_90 = float(qty_90) / 30.0
-
-                prior_avg = (adc_60 + adc_90) / 2.0
-
-                if prior_avg > 0:
-                    change_pct = ((adc_30 - prior_avg) / prior_avg) * 100.0
-                else:
-                    change_pct = 100.0 if adc_30 > 0 else 0.0
-
-                sku = f"SKU-{m.id:04d}"
-                product_name = m.name
-
-                if change_pct >= 10.0:
-                    status_label = "increasing"
-                    message = (
-                        f"Demand for {sku} ({product_name}) has increased by "
-                        f"{change_pct:.1f}% compared to prior averages."
-                    )
-                elif change_pct <= -10.0:
-                    status_label = "decreasing"
-                    message = (
-                        f"Demand for {sku} ({product_name}) has decreased by "
-                        f"{abs(change_pct):.1f}% compared to prior averages."
-                    )
-                else:
-                    status_label = "stable"
-                    message = (
-                        f"Demand for {sku} ({product_name}) remains stable "
-                        f"compared to prior averages."
-                    )
-
-                predictions_list.append({
-                    "material_id": m.id,
-                    "sku": sku,
-                    "material_name": product_name,
-                    "product_name": product_name,
-                    "adc_30": adc_30,
-                    "prior_avg": prior_avg,
-                    "change_pct": change_pct,
-                    "status": status_label,
-                    "message": message,
-                    "current_quantity": float(m.current_quantity) if m.current_quantity is not None else 0.0,
-                    "max_quantity": float(m.max_quantity or 100),
-                    "unit": m.unit,
-                    "low_stock_threshold_percent": m.low_stock_threshold_percent or 30,
-                })
-
-            materials_list = list(materials)
-            active_count = len(materials_list) or 1
-
-            predicted_throughput = sum(p["adc_30"] * 30 for p in predictions_list)
-            prior_throughput = sum(p["prior_avg"] * 30 for p in predictions_list)
-            if prior_throughput > 0:
-                throughput_trend_pct = (
-                    (predicted_throughput - prior_throughput) / prior_throughput
-                ) * 100.0
-            else:
-                throughput_trend_pct = 100.0 if predicted_throughput > 0 else 0.0
-
-            critical_skus = 0
-            for m in materials_list:
-                max_qty = float(m.max_quantity or 100)
-                if max_qty <= 0:
-                    continue
-                percent = (float(m.current_quantity) / max_qty) * 100.0
-                threshold = m.low_stock_threshold_percent or 30
-                if percent <= threshold:
-                    critical_skus += 1
-
-            est_stockout_risk = (critical_skus / active_count) * 100.0
-
-            dead_stock_value, dead_stock_by_currency, dead_stock_breakdown = (
-                _aggregate_deadstock_capital(deadstock_list)
-            )
-
-            accuracy_samples = []
-            week_ago = now - timezone.timedelta(days=7)
-            for p in predictions_list:
-                predicted_week = p["adc_30"] * 7
-                actual_week = float(
-                    StockTransaction.objects.filter(
-                        material_id=p["material_id"],
-                        type=StockTransaction.TYPE_OUT,
-                        created_at__gte=week_ago,
-                    ).aggregate(total=Sum("quantity"))["total"]
-                    or 0
-                )
-                if predicted_week <= 0 and actual_week <= 0:
-                    accuracy_samples.append(100.0)
-                    continue
-                denom = max(actual_week, predicted_week, 1.0)
-                error_ratio = abs(predicted_week - actual_week) / denom
-                accuracy_samples.append(max(0.0, 100.0 - (error_ratio * 100.0)))
-
-            ai_accuracy_rate = (
-                sum(accuracy_samples) / len(accuracy_samples)
-                if accuracy_samples
-                else 94.0
-            )
-
-            weekly_out = _build_weekly_out_totals(request.user, weeks=12)
-            throughput_weekly = [
-                sum(
-                    p["adc_30"] * 7
-                    * (1 + (p["change_pct"] / 100.0) * (idx / 11))
-                    for p in predictions_list
-                )
-                for idx in range(12)
-            ]
-
-            forecast_weeks = 13
-            demand_forecast_points = []
-            for w in range(forecast_weeks):
-                week_total = 0.0
-                for p in predictions_list:
-                    growth = 1 + (p["change_pct"] / 100.0) * (w / max(forecast_weeks - 1, 1))
-                    week_total += max(p["adc_30"] * 7 * growth, 0)
-                point_date = (now + timezone.timedelta(weeks=w)).date().isoformat()
-                demand_forecast_points.append({
-                    "label": f"W{w + 1}",
-                    "date": point_date,
-                    "value": round(week_total, 2),
-                })
-
-            baseline_points = []
-            for i, val in enumerate(weekly_out[-len(demand_forecast_points):]):
-                baseline_points.append({
-                    "label": demand_forecast_points[i]["label"],
-                    "date": demand_forecast_points[i]["date"],
-                    "value": round(val, 2),
-                })
-            if len(baseline_points) < len(demand_forecast_points):
-                baseline_points = [
-                    {"label": p["label"], "date": p["date"], "value": round(p["value"] * 0.85, 2)}
-                    for p in demand_forecast_points
-                ]
-
-            seasonality_points = []
-            for idx, val in enumerate(weekly_out):
-                seasonality_points.append({
-                    "label": f"W{idx + 1}",
-                    "date": (now - timezone.timedelta(weeks=12 - idx)).date().isoformat(),
-                    "value": round(val, 2),
-                })
-
-            def _peak_point(points, predictions_src):
-                if not points:
-                    return None
-                peak = max(points, key=lambda x: x["value"])
-                top_pred = max(predictions_src, key=lambda x: x["change_pct"], default=None)
-                mid = top_pred["material_id"] if top_pred else None
-                return {
-                    "material_name": top_pred["material_name"] if top_pred else "Portfolio",
-                    "sku": f"SKU-{mid:04d}" if mid else "PORTFOLIO",
-                    "peak_date": peak["date"],
-                    "required_capacity": round(peak["value"], 1),
-                    "label": peak["label"],
-                }
-
-            forecast_peak = _peak_point(demand_forecast_points, predictions_list)
-            seasonality_peak = _peak_point(seasonality_points, predictions_list)
-
-            if ai_accuracy_rate >= 97:
-                accuracy_tier = "PLATINUM"
-            elif ai_accuracy_rate >= 90:
-                accuracy_tier = "GOLD"
-            elif ai_accuracy_rate >= 80:
-                accuracy_tier = "SILVER"
-            else:
-                accuracy_tier = "CALIBRATING"
-
-            if dead_stock_value > 15000:
-                dead_stock_tier = "HIGH"
-            elif dead_stock_value > 0:
-                dead_stock_tier = "MEDIUM"
-            else:
-                dead_stock_tier = "NONE"
-
-            return Response({
-                "deadstock": deadstock_list,
-                "dead_stock": deadstock_list,
-                "predictions": predictions_list,
-                "threshold_days": threshold_days,
-                "threshold_value": threshold_value,
-                "threshold_unit": threshold_unit,
-                "metrics": {
-                    "predicted_throughput": round(predicted_throughput, 1),
-                    "throughput_trend_pct": round(throughput_trend_pct, 1),
-                    "throughput_sparkline": _normalize_sparkline(throughput_weekly[-5:]),
-                    "est_stockout_risk": round(est_stockout_risk, 1),
-                    "critical_sku_count": critical_skus,
-                    "stockout_bar_pct": round(est_stockout_risk, 1),
-                    "dead_stock_value": round(dead_stock_value, 2),
-                    "dead_stock_value_egp": round(dead_stock_value, 2),
-                    "dead_stock_by_currency": {
-                        k: round(v, 2) for k, v in dead_stock_by_currency.items()
-                    },
-                    "dead_stock_value_breakdown": dead_stock_breakdown,
-                    "dead_stock_base_currency": BASE_CURRENCY,
-                    "dead_stock_tier": dead_stock_tier,
-                    "dead_stock_sparkline": _normalize_sparkline(
-                        [item["current_quantity"] for item in deadstock_list] or [0]
-                    ),
-                    "ai_accuracy_rate": round(ai_accuracy_rate, 1),
-                    "accuracy_bar_pct": round(ai_accuracy_rate, 1),
-                    "accuracy_tier": accuracy_tier,
-                    "accuracy_sparkline": _normalize_sparkline(accuracy_samples),
-                    "dead_stock_bar_pct": round(
-                        min(100.0, (dead_stock_value / 15000.0) * 100.0) if dead_stock_value else 0.0,
-                        1,
-                    ),
-                },
-                "charts": {
-                    "demand_forecast": {
-                        "points": demand_forecast_points,
-                        "baseline": baseline_points,
-                        "peak": forecast_peak,
-                    },
-                    "seasonality_trend": {
-                        "points": seasonality_points,
-                        "baseline": [],
-                        "peak": seasonality_peak,
-                    },
-                },
-            }, status=status.HTTP_200_OK)
-
+            data = get_or_compute_ai_insights(request.user)
+            return Response(data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+

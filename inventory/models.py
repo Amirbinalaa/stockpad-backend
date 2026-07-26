@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
 
@@ -76,6 +78,9 @@ class Material(models.Model):
 
     class Meta:
         unique_together = [("user", "name")]
+        indexes = [
+            models.Index(fields=["user", "is_active"]),
+        ]
 
     def __str__(self) -> str:
         return self.name
@@ -90,7 +95,7 @@ class StockTransaction(models.Model):
         (TYPE_OUT, "OUT"),
     ]
 
-    material = models.ForeignKey(Material, on_delete=models.CASCADE, related_name="transactions")
+    material = models.ForeignKey(Material, on_delete=models.CASCADE, related_name="transactions", db_index=True)
     type = models.CharField(max_length=3, choices=TYPE_CHOICES)
     quantity = models.DecimalField(max_digits=12, decimal_places=2)
     notes = models.CharField(max_length=255, blank=True)
@@ -100,11 +105,17 @@ class StockTransaction(models.Model):
         null=True,
         blank=True,
         related_name="stock_transactions",
+        db_index=True,
     )
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["material", "created_at"]),
+            models.Index(fields=["type"]),
+        ]
 
 
 class MaterialRequest(models.Model):
@@ -118,12 +129,19 @@ class MaterialRequest(models.Model):
         (STATUS_DENIED, "Denied"),
     ]
 
-    material = models.ForeignKey(Material, on_delete=models.CASCADE, related_name="requests")
+    material = models.ForeignKey(Material, on_delete=models.CASCADE, related_name="requests", db_index=True)
     requester_id = models.CharField(max_length=255)
     requester_email = models.EmailField()
     quantity = models.DecimalField(max_digits=12, decimal_places=2)
     reason = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True)
+    idempotency_key = models.UUIDField(
+        null=True,
+        blank=True,
+        unique=True,
+        db_index=True,
+        help_text="Client-generated UUID to prevent duplicate submissions on retry.",
+    )
     webhook_url = models.URLField(max_length=500)
     review_notes = models.TextField(blank=True)
     reviewed_by = models.ForeignKey(
@@ -132,12 +150,18 @@ class MaterialRequest(models.Model):
         null=True,
         blank=True,
         related_name="reviewed_requests",
+        db_index=True,
     )
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["material", "status"]),
+        ]
 
     def __str__(self) -> str:
         return f"Request for {self.material.name} ({self.status})"
@@ -148,9 +172,11 @@ class EngineerConnection(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="connected_engineers",
+        db_index=True,
     )
     engineer_email = models.EmailField(
         unique=True,
+        db_index=True,
         help_text="The email of the engineer allowed to access this warehouse.",
     )
     is_active = models.BooleanField(default=True)
@@ -158,6 +184,70 @@ class EngineerConnection(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["engineer_email"]),
+            models.Index(fields=["manager", "is_active"]),
+        ]
 
     def __str__(self):
-        return f"{self.engineer_email} -> {self.manager.username}"
+        return f"{self.engineer_email} -> {self.manager.username}"
+
+
+class WebhookDeliveryLog(models.Model):
+    """
+    Dead-letter log for permanently failed outbound webhook deliveries.
+    Persists when a Celery task exhausts all retries without successfully
+    delivering to Site B — prevents silent status drift.
+    """
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    material_request = models.ForeignKey(
+        MaterialRequest,
+        on_delete=models.CASCADE,
+        related_name="webhook_logs",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    webhook_url = models.URLField(max_length=500)
+    payload = models.JSONField()
+    event_id = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Unique event identifier for deduplication on Site B.",
+    )
+    error_message = models.TextField(blank=True)
+    attempt_count = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_FAILED)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"WebhookDeliveryLog [{self.status}] -> {self.webhook_url} @ {self.created_at}"
+
+
+from django.db.models.signals import post_save, post_delete
+from django.dispatch import receiver
+
+
+@receiver([post_save, post_delete], sender=Material)
+@receiver([post_save, post_delete], sender=StockTransaction)
+@receiver([post_save, post_delete], sender=EngineerConnection)
+def _catalog_invalidation_signal(sender, instance, **kwargs):
+    try:
+        from django.core.cache import cache
+        version = cache.get("catalog_cache_version", 1)
+        cache.set("catalog_cache_version", version + 1, timeout=None)
+    except Exception:
+        pass
+
+

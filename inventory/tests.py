@@ -1,11 +1,14 @@
 from decimal import Decimal
 
+from django.conf import settings
+from django.core.cache import cache
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
 
 from .models import Material, StockTransaction, EngineerConnection
+
 
 
 User = get_user_model()
@@ -226,8 +229,9 @@ class MaterialRequestWebhookTests(TestCase):
             is_active=True,
         )
 
+    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_create_material_request_success_and_webhook(self, mock_post):
+    def test_create_material_request_success_and_webhook(self, mock_post, mock_health):
         """Site B can create request using API key. Webhook is sent. Fallback user assigned."""
         url = reverse("inventory:request-create")
         payload = {
@@ -258,8 +262,9 @@ class MaterialRequestWebhookTests(TestCase):
         self.assertEqual(call_kwargs[0][0], "https://site-b.com/webhooks/requests/")
         self.assertIn("X-Site-A-Signature", call_kwargs[1]["headers"])
 
+    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_create_material_request_fallback_superuser(self, mock_post):
+    def test_create_material_request_fallback_superuser(self, mock_post, mock_health):
         """If requester_email is not found, fallback to superuser (admin)."""
         # Clear owner of material for test
         self.material.user = None
@@ -282,8 +287,9 @@ class MaterialRequestWebhookTests(TestCase):
         self.material.refresh_from_db()
         self.assertEqual(self.material.user, self.superuser)
 
+    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_review_material_request_webhook(self, mock_post):
+    def test_review_material_request_webhook(self, mock_post, mock_health):
         """Approving request triggers second webhook with approved status."""
         req = MaterialRequest.objects.create(
             material=self.material,
@@ -320,6 +326,36 @@ class MaterialRequestWebhookTests(TestCase):
         call_kwargs = mock_post.call_args
         self.assertEqual(call_kwargs[0][0], "https://site-b.com/webhooks/requests/")
         self.assertIn("X-Site-A-Signature", call_kwargs[1]["headers"])
+
+    @patch("inventory.tasks.ping_site_b_health", return_value=False)
+    def test_webhook_retry_exhaustion_creates_dead_letter_log(self, mock_health):
+        """When health check fails on all attempts, task exhausts retries and creates a WebhookDeliveryLog record."""
+        from .models import WebhookDeliveryLog
+        from .tasks import send_webhook_task
+
+        webhook_url = "https://site-b.com/webhooks/dead-letter-test/"
+        payload = {
+            "id": 999,
+            "status": "pending",
+            "event_id": "11111111-2222-3333-4444-555555555555",
+        }
+
+        # Call apply with retries at max_retries to trigger MaxRetriesExceeded handling
+        try:
+            send_webhook_task.apply(args=[webhook_url, payload], retries=3)
+        except Exception:
+            pass
+
+        # Assert WebhookDeliveryLog was created with correct fields
+        log = WebhookDeliveryLog.objects.filter(webhook_url=webhook_url).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.webhook_url, webhook_url)
+        self.assertEqual(str(log.event_id), "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(log.attempt_count, 3)
+        self.assertEqual(log.status, WebhookDeliveryLog.STATUS_FAILED)
+        self.assertIn("Site B health check failed", log.error_message)
+
+
 
 
 class TeamAccessControlTests(TestCase):
@@ -392,8 +428,9 @@ class TeamAccessControlTests(TestCase):
         self.assertEqual(resp.data["engineer_email"], "engineer1@example.com")
         self.assertTrue(resp.data["is_active"])
 
+    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_request_creation_security_enforcement(self, mock_post):
+    def test_request_creation_security_enforcement(self, mock_post, mock_health):
         # 1. Attempt request submission without active connection (fails with 403)
         url = reverse("inventory:request-create")
         payload = {
@@ -419,6 +456,7 @@ class TeamAccessControlTests(TestCase):
         self.client.credentials()
         resp = self.client.post(url, payload, format="json", **self.site_b_headers)
         self.assertEqual(resp.status_code, 201)
+
 
 
 class EngineerPEApiTests(TestCase):
@@ -511,5 +549,254 @@ class EngineerPEApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 403)
         self.assertFalse(resp.data["connected"])
+
+
+from django.test import TestCase, override_settings
+
+
+@override_settings(SITE_B_API_KEY="test_b2b_secret")
+class Phase4CachingTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="manager1",
+            email="manager1@example.com",
+            password="password123",
+        )
+        self.user2 = User.objects.create_user(
+            username="manager2",
+            email="manager2@example.com",
+            password="password123",
+        )
+        self.material1 = Material.objects.create(
+            user=self.user,
+            name="Alpha Item",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("100.00"),
+            cost_price=Decimal("10.00"),
+            is_active=True,
+        )
+        self.material2 = Material.objects.create(
+            user=self.user2,
+            name="Beta Item",
+            unit=Material.UNIT_PCS,
+            current_quantity=Decimal("50.00"),
+            cost_price=Decimal("20.00"),
+            is_active=True,
+        )
+        self.conn1 = EngineerConnection.objects.create(
+            manager=self.user,
+            engineer_email="engineer1@example.com",
+            is_active=True,
+        )
+        self.conn2 = EngineerConnection.objects.create(
+            manager=self.user2,
+            engineer_email="engineer2@example.com",
+            is_active=True,
+        )
+        self.api_key = "test_b2b_secret"
+        self.client = APIClient()
+        self.headers = {"HTTP_X_SITE_B_API_KEY": self.api_key}
+        cache.clear()
+
+    def test_ai_insights_caching_and_recompute_task(self):
+        from inventory.tasks import recompute_ai_insights_task
+        self.client.force_authenticate(user=self.user)
+        url = reverse("inventory:insights")
+
+        # First request computes and caches insights
+        resp1 = self.client.get(url)
+        self.assertEqual(resp1.status_code, 200)
+        cache_key = f"ai_insights_user_{self.user.id}"
+        cached_data = cache.get(cache_key)
+        self.assertIsNotNone(cached_data)
+        self.assertIn("metrics", cached_data)
+
+        # Subsequent request retrieves from cache
+        resp2 = self.client.get(url)
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(resp2.data, cached_data)
+
+        # Celery recompute task refreshes cache
+        task_result = recompute_ai_insights_task(user_id=self.user.id)
+        self.assertIn("Recomputed AI insights", task_result)
+        refreshed_cache = cache.get(cache_key)
+        self.assertIsNotNone(refreshed_cache)
+
+    def test_material_catalog_caching_and_invalidation(self):
+        url = reverse("inventory:material-catalog")
+        
+        # 1. Initial version and fetch populates cache under v1
+        version_before = cache.get("catalog_cache_version", 1)
+        resp1 = self.client.get(url, {"email": "engineer1@example.com"}, **self.headers)
+        self.assertEqual(resp1.status_code, 200)
+        self.assertEqual(len(resp1.data), 1)
+        self.assertEqual(resp1.data[0]["name"], "Alpha Item")
+        self.assertEqual(float(resp1.data[0]["quantity"]), 100.0)
+
+        old_cache_key = f"catalog_payload_v{version_before}_engineer1@example.com"
+        self.assertIsNotNone(cache.get(old_cache_key))
+
+        # 2. Modifying stock level and saving material triggers catalog cache invalidation signal
+        self.material1.current_quantity = Decimal("150.00")
+        self.material1.save()
+        StockTransaction.objects.create(
+            material=self.material1,
+            type=StockTransaction.TYPE_IN,
+            quantity=Decimal("50.00"),
+            performed_by=self.user,
+        )
+        self.material1.refresh_from_db()
+        self.assertEqual(self.material1.current_quantity, Decimal("150.00"))
+
+        version_after = cache.get("catalog_cache_version")
+        self.assertGreater(version_after, version_before)
+
+        # 3. Next fetch returns fresh updated stock quantity under new version key
+        resp2 = self.client.get(url, {"email": "engineer1@example.com"}, **self.headers)
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(float(resp2.data[0]["quantity"]), 150.0)
+
+        new_cache_key = f"catalog_payload_v{version_after}_engineer1@example.com"
+        self.assertIsNotNone(cache.get(new_cache_key))
+
+
+
+    def test_catalog_cache_isolation_per_engineer(self):
+        url = reverse("inventory:material-catalog")
+
+        resp_eng1 = self.client.get(url, {"email": "engineer1@example.com"}, **self.headers)
+        self.assertEqual(resp_eng1.status_code, 200)
+        self.assertEqual(len(resp_eng1.data), 1)
+        self.assertEqual(resp_eng1.data[0]["name"], "Alpha Item")
+
+        resp_eng2 = self.client.get(url, {"email": "engineer2@example.com"}, **self.headers)
+        self.assertEqual(resp_eng2.status_code, 200)
+        self.assertEqual(len(resp_eng2.data), 1)
+        self.assertEqual(resp_eng2.data[0]["name"], "Beta Item")
+
+
+class Phase5AlertingAndRotationTests(TestCase):
+    """
+    Tests for Phase 5 — webhook retry spike alerting and key rotation.
+    """
+
+    def setUp(self):
+        self.manager = User.objects.create_user(
+            username="p5manager",
+            email="p5manager@example.com",
+            password="password123",
+        )
+        self.material = Material.objects.create(
+            user=self.manager,
+            name="Phase5 Steel",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("100.00"),
+            is_active=True,
+        )
+        EngineerConnection.objects.create(
+            manager=self.manager,
+            engineer_email="p5eng@example.com",
+            is_active=True,
+        )
+        self.client = APIClient()
+        cache.clear()
+
+    # ── Spike alerting ────────────────────────────────────────────────────────
+
+    @override_settings(WEBHOOK_RETRY_SPIKE_THRESHOLD=3)
+    def test_retry_counter_increments_and_alert_fires(self):
+        """
+        _increment_retry_counter() increments the rolling counter;
+        once the counter reaches the threshold _emit_spike_alert produces
+        a CRITICAL log and check_webhook_retry_spike returns the SPIKE message.
+        """
+        from inventory.tasks import (
+            _increment_retry_counter,
+            _RETRY_SPIKE_COUNTER_KEY,
+            check_webhook_retry_spike,
+        )
+
+        # Counter starts at zero
+        self.assertEqual(cache.get(_RETRY_SPIKE_COUNTER_KEY, 0), 0)
+
+        # Increment three times — should reach threshold
+        _increment_retry_counter()
+        _increment_retry_counter()
+        v = _increment_retry_counter()
+        self.assertEqual(v, 3)
+        self.assertEqual(cache.get(_RETRY_SPIKE_COUNTER_KEY), 3)
+
+        # Periodic check task should detect the spike
+        with self.assertLogs("inventory.tasks", level="CRITICAL") as cm:
+            result = check_webhook_retry_spike()
+
+        self.assertIn("SPIKE ALERT FIRED", result)
+        self.assertTrue(any("[WM ALERT]" in line for line in cm.output))
+
+    @override_settings(WEBHOOK_RETRY_SPIKE_THRESHOLD=10)
+    def test_check_spike_task_returns_ok_when_below_threshold(self):
+        """
+        check_webhook_retry_spike returns an OK string when below threshold.
+        """
+        from inventory.tasks import check_webhook_retry_spike, _increment_retry_counter
+        _increment_retry_counter()  # only 1 retry, threshold is 10
+        result = check_webhook_retry_spike()
+        self.assertTrue(result.startswith("OK"))
+
+    # ── Dual-key rotation ─────────────────────────────────────────────────────
+
+    @override_settings(SITE_B_API_KEY="old-key-abc", SITE_B_API_KEY_NEW="new-key-xyz")
+    def test_catalog_accepts_old_key_during_rotation(self):
+        """
+        During a rotation window, the old SITE_B_API_KEY is still accepted.
+        """
+        url = reverse("inventory:material-catalog")
+        resp = self.client.get(
+            url,
+            {"email": "p5eng@example.com"},
+            HTTP_X_SITE_B_API_KEY="old-key-abc",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    @override_settings(SITE_B_API_KEY="old-key-abc", SITE_B_API_KEY_NEW="new-key-xyz")
+    def test_catalog_accepts_new_key_during_rotation(self):
+        """
+        During a rotation window, the new SITE_B_API_KEY_NEW is also accepted.
+        """
+        url = reverse("inventory:material-catalog")
+        resp = self.client.get(
+            url,
+            {"email": "p5eng@example.com"},
+            HTTP_X_SITE_B_API_KEY="new-key-xyz",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    @override_settings(SITE_B_API_KEY="old-key-abc", SITE_B_API_KEY_NEW="new-key-xyz")
+    def test_catalog_rejects_unknown_key_during_rotation(self):
+        """
+        A request with neither old nor new key is rejected during rotation window.
+        """
+        url = reverse("inventory:material-catalog")
+        resp = self.client.get(
+            url,
+            {"email": "p5eng@example.com"},
+            HTTP_X_SITE_B_API_KEY="completely-wrong-key",
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    @override_settings(SITE_B_API_KEY="", SITE_B_API_KEY_NEW="new-key-xyz")
+    def test_catalog_accepts_new_key_after_old_key_cleared(self):
+        """
+        After cutover (SITE_B_API_KEY cleared), only the new key works.
+        """
+        url = reverse("inventory:material-catalog")
+        resp = self.client.get(
+            url,
+            {"email": "p5eng@example.com"},
+            HTTP_X_SITE_B_API_KEY="new-key-xyz",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+
 
 
