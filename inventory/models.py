@@ -235,6 +235,73 @@ class WebhookDeliveryLog(models.Model):
         return f"WebhookDeliveryLog [{self.status}] -> {self.webhook_url} @ {self.created_at}"
 
 
+class Product(models.Model):
+    STATUS_ACTIVE = "active"
+    STATUS_INACTIVE = "inactive"
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_INACTIVE, "Inactive"),
+    ]
+
+    name = models.CharField(max_length=255)
+    sku = models.CharField(max_length=100, unique=True)
+    category = models.CharField(max_length=100, blank=True)
+    unit_of_measure = models.CharField(max_length=50)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_ACTIVE,
+    )
+    description = models.TextField(blank=True)
+    # Reuses the same upload pipeline (MEDIA_ROOT / media/ directory) as Material.image
+    photo = models.ImageField(upload_to="products/", blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["sku"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.sku})"
+
+
+class ProductMaterial(models.Model):
+    """
+    One line in a Product's Bill of Materials (BOM).
+    Quantity is per finished unit of the product.
+    PROTECT on material: deleting a material that is referenced in any BOM
+    requires explicit handling first — no silent cascade.
+    """
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="bom_lines",
+    )
+    material = models.ForeignKey(
+        Material,
+        on_delete=models.PROTECT,
+        related_name="bom_lines",
+    )
+    # Fractional quantities are valid (e.g. 0.5 kg per unit)
+    quantity_per_unit = models.DecimalField(max_digits=10, decimal_places=3)
+
+    class Meta:
+        unique_together = ("product", "material")
+        indexes = [
+            models.Index(fields=["product"]),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.product.name} — {self.material.name} × {self.quantity_per_unit}"
+        )
+
+
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 

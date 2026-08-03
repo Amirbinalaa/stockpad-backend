@@ -5,6 +5,7 @@ from django.core.cache import cache
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from .models import Material, StockTransaction, EngineerConnection
@@ -797,6 +798,422 @@ class Phase5AlertingAndRotationTests(TestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Product & ProductMaterial (BOM) model tests
+# ---------------------------------------------------------------------------
+from django.db import IntegrityError
+from django.db.models import ProtectedError
+
+from .models import Product, ProductMaterial
+
+
+class ProductModelTests(TestCase):
+    """
+    Unit tests for Product and ProductMaterial model constraints.
+    No views / serializers — pure model-layer assertions.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="prodtestuser", password="pass123456", role="admin"
+        )
+
+    def _make_material(self, name="Steel", unit="kg"):
+        return Material.objects.create(
+            user=self.user,
+            name=name,
+            unit=unit,
+        )
+
+    def _make_product(self, name="Bolt", sku="SKU-001", uom="pcs"):
+        return Product.objects.create(
+            name=name,
+            sku=sku,
+            unit_of_measure=uom,
+        )
+
+    # ------------------------------------------------------------------
+    # Test 1 — SKU uniqueness enforced at the DB level
+    # ------------------------------------------------------------------
+    def test_product_sku_unique(self):
+        """Two products with the same SKU must raise IntegrityError."""
+        self._make_product(name="ProductA", sku="DUP-SKU")
+        with self.assertRaises(IntegrityError):
+            Product.objects.create(
+                name="ProductB",
+                sku="DUP-SKU",
+                unit_of_measure="pcs",
+            )
+
+    # ------------------------------------------------------------------
+    # Test 2 — BOM unique_together (product, material)
+    # ------------------------------------------------------------------
+    def test_bom_unique_together(self):
+        """Duplicate (product, material) in BOM must raise IntegrityError."""
+        product = self._make_product()
+        material = self._make_material()
+
+        ProductMaterial.objects.create(
+            product=product,
+            material=material,
+            quantity_per_unit="2.500",
+        )
+        with self.assertRaises(IntegrityError):
+            ProductMaterial.objects.create(
+                product=product,
+                material=material,
+                quantity_per_unit="1.000",
+            )
+
+    # ------------------------------------------------------------------
+    # Test 3 — quantity_per_unit stores Decimal (including fractions)
+    # ------------------------------------------------------------------
+    def test_bom_decimal_precision(self):
+        """quantity_per_unit stores fractional Decimal values accurately."""
+        from decimal import Decimal
+
+        product = self._make_product()
+        material = self._make_material()
+
+        line = ProductMaterial.objects.create(
+            product=product,
+            material=material,
+            quantity_per_unit="0.500",
+        )
+        line.refresh_from_db()
+        self.assertEqual(line.quantity_per_unit, Decimal("0.500"))
+
+        # Also verify 3 decimal places are retained
+        line.quantity_per_unit = Decimal("12.345")
+        line.save()
+        line.refresh_from_db()
+        self.assertEqual(line.quantity_per_unit, Decimal("12.345"))
+
+    # ------------------------------------------------------------------
+    # Test 4 — Deleting a Product cascades to its BOM lines
+    # ------------------------------------------------------------------
+    def test_product_delete_cascades_bom_lines(self):
+        """Deleting a Product removes all associated ProductMaterial rows."""
+        product = self._make_product()
+        material = self._make_material()
+
+        line = ProductMaterial.objects.create(
+            product=product,
+            material=material,
+            quantity_per_unit="1.000",
+        )
+        line_id = line.pk
+
+        product.delete()
+        self.assertFalse(ProductMaterial.objects.filter(pk=line_id).exists())
+
+    # ------------------------------------------------------------------
+    # Test 5 — Deleting a Material referenced in a BOM raises ProtectedError
+    # ------------------------------------------------------------------
+    def test_material_delete_protected_by_bom(self):
+        """Deleting a Material used in a BOM line must raise ProtectedError."""
+        product = self._make_product()
+        material = self._make_material()
+
+        ProductMaterial.objects.create(
+            product=product,
+            material=material,
+            quantity_per_unit="3.000",
+        )
+
+        with self.assertRaises(ProtectedError):
+            material.delete()
+
+        # Material must still exist in the database
+        self.assertTrue(Material.objects.filter(pk=material.pk).exists())
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Product & BOM API Endpoint Tests
+# ---------------------------------------------------------------------------
+class ProductApiTests(TestCase):
+    """
+    API integration tests for Product CRUD, BOM management, and Material Quick-Create.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="wmuser", password="password123", role="admin"
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.mat1 = Material.objects.create(
+            user=self.user, name="Oak Wood", unit="m", current_quantity=Decimal("100.00")
+        )
+        self.mat2 = Material.objects.create(
+            user=self.user, name="Varnish", unit="L", current_quantity=Decimal("50.00")
+        )
+
+    def test_create_product_with_nested_bom(self):
+        """POST /api/inventory/products/ creates a product and nested BOM lines."""
+        url = reverse("inventory:product-list-create")
+        payload = {
+            "name": "Dining Table",
+            "sku": "TAB-OAK-001",
+            "category": "Furniture",
+            "unit_of_measure": "set",
+            "status": "active",
+            "description": "Solid oak dining table",
+            "bom_lines": [
+                {"material": self.mat1.id, "quantity_per_unit": "5.000"},
+                {"material": self.mat2.id, "quantity_per_unit": "0.750"},
+            ],
+        }
+        response = self.client.post(url, data=payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["sku"], "TAB-OAK-001")
+        self.assertEqual(len(response.data["bom_lines"]), 2)
+
+        # Verify DB records created
+        product = Product.objects.get(sku="TAB-OAK-001")
+        self.assertEqual(product.bom_lines.count(), 2)
+
+    def test_create_product_duplicate_material_bom_error(self):
+        """POST /api/inventory/products/ with duplicate material in BOM lines returns 400."""
+        url = reverse("inventory:product-list-create")
+        payload = {
+            "name": "Invalid Chair",
+            "sku": "CHR-DUP-001",
+            "unit_of_measure": "pcs",
+            "bom_lines": [
+                {"material": self.mat1.id, "quantity_per_unit": "2.000"},
+                {"material": self.mat1.id, "quantity_per_unit": "1.000"},
+            ],
+        }
+        response = self.client.post(url, data=payload, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("bom_lines", response.data)
+
+    def test_create_product_duplicate_sku_error(self):
+        """POST /api/inventory/products/ with duplicate SKU returns 400."""
+        Product.objects.create(name="Exist Table", sku="EXIST-SKU", unit_of_measure="pcs")
+        url = reverse("inventory:product-list-create")
+        payload = {
+            "name": "New Table",
+            "sku": "EXIST-SKU",
+            "unit_of_measure": "pcs",
+        }
+        response = self.client.post(url, data=payload, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_product_bom_put_full_replace(self):
+        """PUT /api/inventory/products/<id>/bom/ wipes existing BOM lines and replaces them."""
+        product = Product.objects.create(name="Desk", sku="DESK-01", unit_of_measure="pcs")
+        ProductMaterial.objects.create(product=product, material=self.mat1, quantity_per_unit=Decimal("2.000"))
+
+        url = reverse("inventory:product-bom", kwargs={"pk": product.pk})
+        new_payload = [
+            {"material": self.mat2.id, "quantity_per_unit": "1.500"}
+        ]
+        response = self.client.put(url, data=new_payload, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        # Mat1 should be removed, Mat2 should remain
+        lines = ProductMaterial.objects.filter(product=product)
+        self.assertEqual(lines.count(), 1)
+        self.assertEqual(lines.first().material, self.mat2)
+
+    def test_product_bom_patch_incremental_upsert(self):
+        """PATCH /api/inventory/products/<id>/bom/ adds or updates lines without deleting omitted ones."""
+        product = Product.objects.create(name="Desk", sku="DESK-02", unit_of_measure="pcs")
+        ProductMaterial.objects.create(product=product, material=self.mat1, quantity_per_unit=Decimal("2.000"))
+
+        url = reverse("inventory:product-bom", kwargs={"pk": product.pk})
+        patch_payload = [
+            {"material": self.mat2.id, "quantity_per_unit": "0.500"}
+        ]
+        response = self.client.patch(url, data=patch_payload, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        # Both Mat1 and Mat2 should be in BOM
+        lines = ProductMaterial.objects.filter(product=product)
+        self.assertEqual(lines.count(), 2)
+
+    def test_material_quick_create_success(self):
+        """POST /api/inventory/materials/quick-create/ creates material with initial_quantity=0."""
+        url = reverse("inventory:material-quick-create")
+        payload = {"name": "Brass Screws", "unit": "pcs"}
+        response = self.client.post(url, data=payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["name"], "Brass Screws")
+        self.assertEqual(response.data["unit"], "pcs")
+
+        # Check DB record
+        mat = Material.objects.get(name="Brass Screws", user=self.user)
+        self.assertEqual(mat.current_quantity, Decimal("0.00"))
+
+    def test_material_quick_create_case_insensitive_duplicate_error(self):
+        """POST /api/inventory/materials/quick-create/ with existing name (case-insensitive) returns 400."""
+        url = reverse("inventory:material-quick-create")
+        payload = {"name": "oak wood", "unit": "m"}
+        response = self.client.post(url, data=payload, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("name", response.data)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Implied Demand Insights API Tests
+# ---------------------------------------------------------------------------
+class Phase4ImpliedDemandApiTests(TestCase):
+    """
+    Unit tests for Phase 4 Implied Demand Insights calculation and API endpoint.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            username="demand_user", password="password123", role="admin"
+        )
+        self.user2 = User.objects.create_user(
+            username="other_user", password="password123", role="admin"
+        )
+        self.client.force_authenticate(user=self.user)
+
+        # Create materials for user
+        self.mat_wood = Material.objects.create(
+            user=self.user, name="Oak Wood", unit="kg", current_quantity=Decimal("500.00")
+        )
+        self.mat_glue = Material.objects.create(
+            user=self.user, name="Wood Glue", unit="L", current_quantity=Decimal("100.00")
+        )
+
+        # Create StockTransaction OUT records (50 kg Wood out, 10 L Glue out)
+        StockTransaction.objects.create(
+            material=self.mat_wood,
+            type=StockTransaction.TYPE_OUT,
+            quantity=Decimal("50.00"),
+            performed_by=self.user,
+        )
+        StockTransaction.objects.create(
+            material=self.mat_glue,
+            type=StockTransaction.TYPE_OUT,
+            quantity=Decimal("10.00"),
+            performed_by=self.user,
+        )
+
+        # Create Product 1 ("Dining Table")
+        # BOM: Wood 5 kg/unit, Glue 0.5 L/unit
+        # Wood ratio = 50 / 5 = 10
+        # Glue ratio = 10 / 0.5 = 20
+        # Implied Demand = 10 + 20 = 30.0
+        self.prod_table = Product.objects.create(
+            name="Dining Table", sku="TAB-001", unit_of_measure="pcs", status=Product.STATUS_ACTIVE
+        )
+        ProductMaterial.objects.create(
+            product=self.prod_table, material=self.mat_wood, quantity_per_unit=Decimal("5.000")
+        )
+        ProductMaterial.objects.create(
+            product=self.prod_table, material=self.mat_glue, quantity_per_unit=Decimal("0.500")
+        )
+
+        # Create Product 2 ("Wooden Box")
+        # BOM: Wood 25 kg/unit
+        # Wood ratio = 50 / 25 = 2.0
+        # Implied Demand = 2.0
+        self.prod_box = Product.objects.create(
+            name="Wooden Box", sku="BOX-001", unit_of_measure="pcs", status=Product.STATUS_ACTIVE
+        )
+        ProductMaterial.objects.create(
+            product=self.prod_box, material=self.mat_wood, quantity_per_unit=Decimal("25.000")
+        )
+
+        # Create Product 3 ("Empty BOM Product")
+        # BOM: empty -> Implied Demand = 0.0
+        self.prod_empty = Product.objects.create(
+            name="Empty Product", sku="EMP-001", unit_of_measure="pcs", status=Product.STATUS_ACTIVE
+        )
+
+    def test_implied_demand_calculation_and_labeling(self):
+        """GET /api/inventory/products/insights/implied-demand/ calculates correct sum-ratios and labels."""
+        url = reverse("inventory:product-implied-demand-insights")
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["metric_label"], "Implied Demand (estimate)")
+        self.assertEqual(response.data["label"], "Implied Demand (estimate)")
+
+        results = response.data["results"]
+        self.assertGreaterEqual(len(results), 3)
+
+        # Product 1 ("Dining Table") must be ranked #1 with 30.0
+        table_item = results[0]
+        self.assertEqual(table_item["name"], "Dining Table")
+        self.assertEqual(table_item["implied_demand"], 30.0)
+        self.assertEqual(table_item["implied_demand_label"], "Implied Demand (estimate)")
+
+        # Product 2 ("Wooden Box") must be ranked #2 with 2.0
+        box_item = results[1]
+        self.assertEqual(box_item["name"], "Wooden Box")
+        self.assertEqual(box_item["implied_demand"], 2.0)
+        self.assertEqual(box_item["implied_demand_label"], "Implied Demand (estimate)")
+
+        # Product 3 ("Empty Product") must have implied demand = 0.0
+        empty_item = results[2]
+        self.assertEqual(empty_item["name"], "Empty Product")
+        self.assertEqual(empty_item["implied_demand"], 0.0)
+
+    def test_implied_demand_limit_param(self):
+        """GET request respects limit parameter."""
+        url = reverse("inventory:product-implied-demand-insights")
+        response = self.client.get(url, {"limit": "2"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["results"]), 2)
+        self.assertEqual(response.data["limit"], 2)
+
+    def test_implied_demand_period_param(self):
+        """GET request respects period filtering (e.g. 7days vs 30days)."""
+        # Create an old transaction 40 days ago (outside 30days window)
+        old_time = timezone.now() - timezone.timedelta(days=40)
+        tx = StockTransaction.objects.create(
+            material=self.mat_wood,
+            type=StockTransaction.TYPE_OUT,
+            quantity=Decimal("100.00"),
+            performed_by=self.user,
+        )
+        # Manually update created_at to old_time
+        StockTransaction.objects.filter(pk=tx.pk).update(created_at=old_time)
+
+        url = reverse("inventory:product-implied-demand-insights")
+        
+        # 30 days query ignores the 40-day-old transaction (50 out -> demand for Box is 50/25 = 2.0)
+        resp_30 = self.client.get(url, {"period": "30days"})
+        box_30 = next(i for i in resp_30.data["results"] if i["sku"] == "BOX-001")
+        self.assertEqual(box_30["implied_demand"], 2.0)
+
+        # 90 days query includes the 40-day-old transaction (150 out -> demand for Box is 150/25 = 6.0)
+        resp_90 = self.client.get(url, {"period": "90days"})
+        box_90 = next(i for i in resp_90.data["results"] if i["sku"] == "BOX-001")
+        self.assertEqual(box_90["implied_demand"], 6.0)
+
+    def test_user_isolation(self):
+        """Transactions belonging to another user are excluded from calculation."""
+        # Create material and transaction for user2
+        mat_u2 = Material.objects.create(
+            user=self.user2, name="Other Wood", unit="kg", current_quantity=Decimal("1000.00")
+        )
+        StockTransaction.objects.create(
+            material=mat_u2,
+            type=StockTransaction.TYPE_OUT,
+            quantity=Decimal("5000.00"),
+            performed_by=self.user2,
+        )
+
+        # Authenticate as user1 (self.user)
+        url = reverse("inventory:product-implied-demand-insights")
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        table_item = next(i for i in response.data["results"] if i["sku"] == "TAB-001")
+        # Should still be 30.0, unaffected by user2's 5000.0 out transaction
+        self.assertEqual(table_item["implied_demand"], 30.0)
 
 
 

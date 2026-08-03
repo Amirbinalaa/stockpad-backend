@@ -1,7 +1,10 @@
+import json
+from decimal import Decimal
+
 from django.db import transaction as db_transaction
 from rest_framework import serializers
 
-from .models import Material, StockTransaction, MaterialRequest, EngineerConnection
+from .models import Material, StockTransaction, MaterialRequest, EngineerConnection, Product, ProductMaterial
 
 # Unit → PE catalog category (no DB category field on Material)
 _UNIT_CATEGORY_MAP = {
@@ -281,3 +284,167 @@ class EngineerConnectionSerializer(serializers.ModelSerializer):
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Product & BOM Serializers
+# ---------------------------------------------------------------------------
+
+class MaterialQuickCreateSerializer(serializers.ModelSerializer):
+    """
+    Dedicated quick-create path for the BOM material search mini-form.
+    MaterialCreateSerializer is NOT modified — this class is isolated.
+
+    Differences from MaterialCreateSerializer:
+    - initial_quantity is optional (defaults to 0.00) — the user did not
+      come from the main Add Material flow, so stock tracking starts at zero.
+    - Validates name uniqueness case-insensitively per user to prevent
+      duplicates that only differ by casing.
+    """
+    initial_quantity = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        write_only=True,
+        default=Decimal("0.00"),
+    )
+
+    class Meta:
+        model = Material
+        fields = ["id", "name", "unit", "initial_quantity", "current_quantity", "updated_at"]
+        read_only_fields = ["id", "current_quantity", "updated_at"]
+
+    def validate_name(self, value):
+        value = value.strip()
+        request = self.context.get("request")
+        user = request.user if request else None
+        if user and Material.objects.filter(user=user, name__iexact=value).exists():
+            raise serializers.ValidationError(
+                "A material with this name already exists in your catalog."
+            )
+        return value
+
+    @db_transaction.atomic
+    def create(self, validated_data):
+        initial_quantity = validated_data.pop("initial_quantity", Decimal("0.00"))
+        material = Material.objects.create(
+            current_quantity=initial_quantity,
+            **validated_data,
+        )
+        # Always record an initial IN transaction, even for zero-quantity quick-creates.
+        StockTransaction.objects.create(
+            material=material,
+            type=StockTransaction.TYPE_IN,
+            quantity=initial_quantity,
+            notes="Initial quantity (quick-create)",
+            performed_by=self.context["request"].user if self.context.get("request") else None,
+        )
+        return material
+
+
+class ProductMaterialSerializer(serializers.ModelSerializer):
+    """Serializes one BOM line (read + write)."""
+    material_name = serializers.ReadOnlyField(source="material.name")
+    material_unit = serializers.ReadOnlyField(source="material.unit")
+
+    class Meta:
+        model = ProductMaterial
+        fields = ["id", "material", "material_name", "material_unit", "quantity_per_unit"]
+        read_only_fields = ["id", "material_name", "material_unit"]
+
+    def validate_quantity_per_unit(self, value):
+        if value <= 0:
+            raise serializers.ValidationError(
+                "quantity_per_unit must be greater than zero."
+            )
+        return value
+
+
+class ProductSerializer(serializers.ModelSerializer):
+    """
+    Full Product serializer with nested BOM lines (read and write).
+
+    Photo + BOM in the same multipart request:
+    When the client sends a multipart/form-data request (photo upload),
+    bom_lines arrives as a JSON-stringified string.  to_internal_value()
+    parses it so the rest of the validation pipeline sees a proper list.
+
+    BOM uniqueness:
+    Duplicate material IDs within the same payload are caught here, before
+    any DB write, so callers receive a clear 400 ValidationError instead of
+    a raw IntegrityError.
+    """
+    bom_lines = ProductMaterialSerializer(many=True, required=False)
+
+    class Meta:
+        model = Product
+        fields = [
+            "id",
+            "name",
+            "sku",
+            "category",
+            "unit_of_measure",
+            "status",
+            "description",
+            "photo",
+            "bom_lines",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def to_internal_value(self, data):
+        """
+        Handle multipart/form-data requests where bom_lines is a
+        JSON-stringified string rather than a native list.
+        """
+        mutable_data = data.copy() if hasattr(data, "copy") else dict(data)
+
+        raw_bom = mutable_data.get("bom_lines")
+        if isinstance(raw_bom, str):
+            try:
+                parsed = json.loads(raw_bom)
+            except (json.JSONDecodeError, ValueError):
+                raise serializers.ValidationError(
+                    {"bom_lines": "bom_lines must be a valid JSON array."}
+                )
+            mutable_data["bom_lines"] = parsed
+
+        return super().to_internal_value(mutable_data)
+
+    def validate_bom_lines(self, value):
+        """Catch duplicate material IDs in the submitted payload."""
+        seen = set()
+        for item in value:
+            mat = item.get("material")
+            mat_id = getattr(mat, "id", mat)  # may be model instance or PK
+            if mat_id in seen:
+                raise serializers.ValidationError(
+                    "Duplicate material detected in BOM lines — each material "
+                    "may appear at most once per product."
+                )
+            seen.add(mat_id)
+        return value
+
+    @db_transaction.atomic
+    def create(self, validated_data):
+        bom_lines_data = validated_data.pop("bom_lines", [])
+        product = Product.objects.create(**validated_data)
+        for line in bom_lines_data:
+            ProductMaterial.objects.create(product=product, **line)
+        return product
+
+    @db_transaction.atomic
+    def update(self, instance, validated_data):
+        bom_lines_data = validated_data.pop("bom_lines", None)
+
+        # Update scalar product fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        # Full BOM replace only when bom_lines is explicitly present in the payload
+        if bom_lines_data is not None:
+            instance.bom_lines.all().delete()
+            for line in bom_lines_data:
+                ProductMaterial.objects.create(product=instance, **line)
+
+        return instance

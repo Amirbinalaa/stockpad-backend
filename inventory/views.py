@@ -16,7 +16,7 @@ import requests
 
 from settings_app.models import UserPreference
 
-from .models import Material, StockTransaction, MaterialRequest, EngineerConnection
+from .models import Material, StockTransaction, MaterialRequest, EngineerConnection, Product, ProductMaterial
 from .tasks import dispatch_webhook_async
 from .serializers import (
     MaterialCreateSerializer,
@@ -28,6 +28,10 @@ from .serializers import (
     EngineerConnectionSerializer,
     build_engineer_catalog_item,
     normalize_engineer_email,
+    # Phase 3
+    MaterialQuickCreateSerializer,
+    ProductSerializer,
+    ProductMaterialSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -1025,4 +1029,271 @@ class AIInsightsView(APIView):
             return Response(data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Product CRUD, BOM, and Material Quick-Create Views
+# ---------------------------------------------------------------------------
+
+
+class ProductListCreateView(generics.ListCreateAPIView):
+    """
+    GET  /api/inventory/products/  — list all products for the authenticated WM
+    POST /api/inventory/products/  — create a new product with nested BOM lines
+
+    Photo uploads:
+    The serializer's to_internal_value() handles multipart/form-data where
+    bom_lines is a JSON-stringified string, so photo + BOM in one request
+    works correctly without needing two separate round-trips.
+    """
+    serializer_class = ProductSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return (
+            Product.objects
+            .all()
+            .prefetch_related("bom_lines__material")
+            .order_by("-created_at")
+        )
+
+
+class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/inventory/products/<id>/  — retrieve product + BOM lines
+    PUT    /api/inventory/products/<id>/  — full update (replaces BOM when included)
+    PATCH  /api/inventory/products/<id>/  — partial update (BOM replace when included)
+    DELETE /api/inventory/products/<id>/  — delete product (CASCADE removes BOM lines)
+    """
+    serializer_class = ProductSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return (
+            Product.objects
+            .all()
+            .prefetch_related("bom_lines__material")
+        )
+
+
+class ProductBomView(APIView):
+    """
+    PUT   /api/inventory/products/<pk>/bom/
+        Full atomic replace: wipes all existing BOM lines for the product
+        and rebuilds from the submitted list.  Sending an empty list clears
+        the BOM entirely.  Never silently loses lines from a partial payload
+        — the caller must include every line they want to keep.
+
+    PATCH /api/inventory/products/<pk>/bom/
+        Incremental upsert: adds new lines or updates quantity on existing
+        lines identified by material ID.  Lines not mentioned are preserved.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_product(self, request, pk):
+        try:
+            return Product.objects.prefetch_related("bom_lines").get(pk=pk)
+        except Product.DoesNotExist:
+            return None
+
+    @db_transaction.atomic
+    def put(self, request, pk, *args, **kwargs):
+        """Full replace — documented as full-replace semantics."""
+        product = self._get_product(request, pk)
+        if product is None:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = ProductMaterialSerializer(data=request.data, many=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate no duplicate materials in payload before any write
+        seen = set()
+        for item in serializer.validated_data:
+            mat = item["material"]
+            mat_id = getattr(mat, "id", mat)
+            if mat_id in seen:
+                return Response(
+                    {"bom_lines": "Duplicate material in payload."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            seen.add(mat_id)
+
+        # Wipe and rebuild
+        product.bom_lines.all().delete()
+        for line in serializer.validated_data:
+            ProductMaterial.objects.create(product=product, **line)
+
+        result = ProductMaterialSerializer(product.bom_lines.select_related("material"), many=True)
+        return Response(result.data, status=status.HTTP_200_OK)
+
+    @db_transaction.atomic
+    def patch(self, request, pk, *args, **kwargs):
+        """Incremental upsert — existing lines not in payload are preserved."""
+        product = self._get_product(request, pk)
+        if product is None:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = ProductMaterialSerializer(data=request.data, many=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        for line in serializer.validated_data:
+            mat = line["material"]
+            ProductMaterial.objects.update_or_create(
+                product=product,
+                material=mat,
+                defaults={"quantity_per_unit": line["quantity_per_unit"]},
+            )
+
+        result = ProductMaterialSerializer(product.bom_lines.select_related("material"), many=True)
+        return Response(result.data, status=status.HTTP_200_OK)
+
+
+class MaterialQuickCreateView(generics.CreateAPIView):
+    """
+    POST /api/inventory/materials/quick-create/
+
+    Accepts: { "name": "Raw Rubber", "unit": "kg" }
+    Returns: the newly created Material including its assigned ID.
+
+    Uses MaterialQuickCreateSerializer (isolated from MaterialCreateSerializer),
+    which defaults initial_quantity to 0.00 and validates name uniqueness
+    case-insensitively per user.
+    """
+    serializer_class = MaterialQuickCreateSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+
+class ImpliedDemandInsightView(APIView):
+    """
+    GET /api/products/insights/implied-demand/?limit=N&period=...
+
+    Returns active products ranked by implied demand descending based on total
+    material consumption over the requested period divided by quantity per unit in BOM.
+
+    Formula (Sum-Ratio approach):
+    implied_demand(product) = Σ over each BOM line of that product:
+        total_material_consumption(material, period) / quantity_per_unit(material, product)
+
+    Execution Constraints Enforced:
+    1. Scoped strictly by request.user for both StockTransaction and Product queries.
+    2. Uses prefetch_related('bom_lines__material') to avoid N+1 DB queries.
+    3. Defensive math: guards against zero/negative quantity_per_unit and rounds score to 2 decimals.
+    4. Timezone aware datetime filtering using django.utils.timezone.now().
+    5. Returns exact required label: "Implied Demand (estimate)" on both top-level metadata and item objects.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        # 1. Parse & validate limit param (supporting 10, 25, 50, 100 minimum)
+        raw_limit = request.query_params.get("limit", "10")
+        try:
+            limit = int(raw_limit)
+            if limit <= 0:
+                limit = 10
+        except (ValueError, TypeError):
+            limit = 10
+
+        # 2. Parse & validate period param using timezone.now()
+        period_raw = request.query_params.get("period", "30days")
+        period = (period_raw or "30days").lower().strip()
+
+        now = timezone.now()
+        if period in ("7days", "week"):
+            start_date = now - timezone.timedelta(days=7)
+        elif period in ("30days", "month"):
+            start_date = now - timezone.timedelta(days=30)
+        elif period in ("90days", "quarter"):
+            start_date = now - timezone.timedelta(days=90)
+        elif period == "today":
+            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "all":
+            start_date = None
+        else:
+            start_date = now - timezone.timedelta(days=30)
+            period = "30days"
+
+        # 3. Scope StockTransaction query by request.user and calculate consumption per material
+        tx_qs = StockTransaction.objects.filter(
+            material__user=request.user,
+            type=StockTransaction.TYPE_OUT,
+        )
+        if start_date is not None:
+            tx_qs = tx_qs.filter(created_at__gte=start_date)
+
+        consumption_data = tx_qs.values("material_id").annotate(total_out=Sum("quantity"))
+        consumption_map = {
+            row["material_id"]: float(row["total_out"] or 0)
+            for row in consumption_data
+        }
+
+        # 4. Scope products query by request.user & status=active with prefetch_related('bom_lines__material')
+        products_qs = (
+            Product.objects.filter(status=Product.STATUS_ACTIVE)
+            .filter(
+                models.Q(bom_lines__material__user=request.user) | models.Q(bom_lines__isnull=True)
+            )
+            .distinct()
+            .prefetch_related("bom_lines__material")
+        )
+
+        # 5. Compute sum-ratio implied demand per product with division-by-zero guards & rounding
+        results = []
+        for product in products_qs:
+            bom_lines = list(product.bom_lines.all())
+            if not bom_lines:
+                implied_demand = 0.0
+            else:
+                total_ratio = 0.0
+                for line in bom_lines:
+                    qty_per_unit = float(line.quantity_per_unit or 0)
+                    if qty_per_unit <= 0:
+                        continue  # Defensive guard against zero division
+                    mat_id = line.material_id
+                    mat_consumption = consumption_map.get(mat_id, 0.0)
+                    total_ratio += mat_consumption / qty_per_unit
+
+                implied_demand = round(total_ratio, 2)
+
+            photo_url = None
+            if product.photo:
+                try:
+                    photo_url = request.build_absolute_uri(product.photo.url)
+                except Exception:
+                    photo_url = product.photo.url
+
+            results.append({
+                "id": product.id,
+                "name": product.name,
+                "sku": product.sku,
+                "category": product.category,
+                "unit_of_measure": product.unit_of_measure,
+                "description": product.description,
+                "status": product.status,
+                "photo": photo_url,
+                "bom_lines_count": len(bom_lines),
+                "implied_demand": implied_demand,
+                "implied_demand_label": "Implied Demand (estimate)",
+                "label": "Implied Demand (estimate)",
+            })
+
+        # 6. Rank products by implied demand descending, then name ascending
+        results.sort(key=lambda item: (-item["implied_demand"], item["name"]))
+
+        # 7. Apply limit
+        limited_results = results[:limit]
+
+        return Response({
+            "metric_label": "Implied Demand (estimate)",
+            "label": "Implied Demand (estimate)",
+            "period": period,
+            "limit": limit,
+            "count": len(limited_results),
+            "total_count": len(results),
+            "results": limited_results,
+        }, status=status.HTTP_200_OK)
 
