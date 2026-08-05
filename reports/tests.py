@@ -35,6 +35,10 @@ class ProcurementPlanningReportTestCase(APITestCase):
         self.assertEqual(response.data["kpis"]["reorder_count"], 0)
         self.assertEqual(response.data["kpis"]["blocked_products_count"], 0)
         self.assertEqual(response.data["kpis"]["healthy_count"], 0)
+        self.assertEqual(response.data["kpis"]["dead_stock_value_egp"], 0.0)
+        self.assertEqual(response.data["kpis"]["dead_stock_count"], 0)
+        self.assertEqual(response.data["executive_summary"]["critical_bottlenecks"], [])
+        self.assertEqual(response.data["executive_summary"]["idle_stock_warnings"], [])
         self.assertEqual(response.data["materials"], [])
 
     def test_procurement_calculations_and_state_machine(self):
@@ -161,3 +165,45 @@ class ProcurementPlanningReportTestCase(APITestCase):
         self.assertEqual(resin["current_stock"], 500.0)
         self.assertEqual(resin["allocated_stock"], 50.0)
         self.assertEqual(resin["available_stock"], 450.0)
+        self.assertEqual(resin["aging_action"], "ACTIVE")
+        self.assertFalse(resin["is_dead_stock"])
+
+        self.assertIn("executive_summary", response.data)
+        self.assertEqual(len(response.data["executive_summary"]["critical_bottlenecks"]), 1)
+
+    def test_dead_stock_metrics_and_executive_summary(self):
+        """Idle stock beyond threshold surfaces RELOCATE/LIQUIDATE and capital at risk."""
+        mat_idle = Material.objects.create(
+            user=self.user,
+            name="Stale Resin Drum",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("100.00"),
+            cost_price=Decimal("765.00"),
+            currency=Material.CURRENCY_EGP,
+        )
+        old_out_date = timezone.now() - timedelta(days=40)
+        tx = StockTransaction.objects.create(
+            material=mat_idle,
+            type=StockTransaction.TYPE_OUT,
+            quantity=Decimal("1.00"),
+            performed_by=self.user,
+        )
+        StockTransaction.objects.filter(pk=tx.pk).update(created_at=old_out_date)
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        row = next(m for m in response.data["materials"] if m["material_name"] == "Stale Resin Drum")
+        self.assertTrue(row["is_dead_stock"])
+        self.assertEqual(row["aging_action"], "RELOCATE")
+        self.assertGreaterEqual(row["idle_days"], 40)
+        self.assertEqual(row["capital_at_risk"], 76500.0)
+
+        kpis = response.data["kpis"]
+        self.assertEqual(kpis["dead_stock_count"], 1)
+        self.assertEqual(kpis["dead_stock_value_egp"], 76500.0)
+
+        idle_warnings = response.data["executive_summary"]["idle_stock_warnings"]
+        self.assertEqual(len(idle_warnings), 1)
+        self.assertEqual(idle_warnings[0]["material_name"], "Stale Resin Drum")
+        self.assertEqual(idle_warnings[0]["aging_action"], "RELOCATE")

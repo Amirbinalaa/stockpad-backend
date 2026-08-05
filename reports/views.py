@@ -11,13 +11,17 @@ from __future__ import annotations
 import math
 from datetime import timedelta
 
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, Max, Sum
 from django.utils import timezone
 from rest_framework import permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from inventory.models import Material, MaterialRequest, ProductMaterial, StockTransaction
+from inventory.models import Material, MaterialRequest, StockTransaction
+from inventory.views import (
+    _aggregate_deadstock_capital,
+    _resolve_dead_stock_threshold,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +31,10 @@ STATUS_CRITICAL     = "CRITICAL"
 STATUS_NO_DATA      = "NO_DATA"
 STATUS_REORDER_SOON = "REORDER_SOON"
 STATUS_HEALTHY      = "HEALTHY"
+
+AGING_ACTIVE    = "ACTIVE"
+AGING_RELOCATE  = "RELOCATE"
+AGING_LIQUIDATE = "LIQUIDATE"
 
 
 def _compute_action_status(
@@ -53,6 +61,80 @@ def _compute_action_status(
     return STATUS_HEALTHY
 
 
+def _compute_aging_metrics(
+    *,
+    current_stock: float,
+    last_out_at,
+    created_at,
+    has_recent_out: bool,
+    threshold_days: int,
+    cost_price: float,
+    currency: str,
+    now,
+) -> dict:
+    """Derive idle-days, dead-stock flag, capital at risk, and recommended action."""
+    if current_stock <= 0:
+        return {
+            "idle_days": None,
+            "aging_action": AGING_ACTIVE,
+            "is_dead_stock": False,
+            "capital_at_risk": 0.0,
+            "currency": currency,
+        }
+
+    if last_out_at:
+        inactive_since = last_out_at
+    elif created_at:
+        inactive_since = created_at
+    else:
+        inactive_since = now - timedelta(days=threshold_days)
+
+    idle_days = max(0, int((now - inactive_since).total_seconds() // 86400))
+
+    if has_recent_out or idle_days < threshold_days:
+        return {
+            "idle_days": idle_days,
+            "aging_action": AGING_ACTIVE,
+            "is_dead_stock": False,
+            "capital_at_risk": 0.0,
+            "currency": currency,
+        }
+
+    capital_at_risk = current_stock * cost_price
+    aging_action = (
+        AGING_LIQUIDATE
+        if idle_days >= int(threshold_days * 1.5)
+        else AGING_RELOCATE
+    )
+    return {
+        "idle_days": idle_days,
+        "aging_action": aging_action,
+        "is_dead_stock": True,
+        "capital_at_risk": capital_at_risk,
+        "currency": currency,
+    }
+
+
+def _empty_report_payload(threshold_days: int = 30) -> dict:
+    return {
+        "kpis": {
+            "critical_count": 0,
+            "reorder_count": 0,
+            "blocked_products_count": 0,
+            "healthy_count": 0,
+            "dead_stock_value_egp": 0.0,
+            "dead_stock_count": 0,
+        },
+        "executive_summary": {
+            "critical_bottlenecks": [],
+            "idle_stock_warnings": [],
+        },
+        "dead_stock_threshold_days": threshold_days,
+        "categories": [],
+        "materials": [],
+    }
+
+
 class ProcurementPlanningReportView(APIView):
     """
     Returns a pre-computed Procurement & Planning analytics payload for
@@ -62,13 +144,18 @@ class ProcurementPlanningReportView(APIView):
       - One query for materials (with prefetch of BOM lines + products)
       - One aggregate query for allocated stock across all materials
       - One aggregate query for 30-day outflow transactions across all materials
+      - One aggregate query for last OUT timestamp per material
+      - One aggregate query for recent OUT activity inside dead-stock window
       - No per-material loops that touch the DB
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
         user = request.user
-        thirty_days_ago = timezone.now() - timedelta(days=30)
+        now = timezone.now()
+        thirty_days_ago = now - timedelta(days=30)
+        threshold_days, _, _ = _resolve_dead_stock_threshold(user)
+        cutoff = now - timedelta(days=threshold_days)
 
         # ── 1. Load all active materials + BOM lines in 3 queries (ORM join) ──
         materials = list(
@@ -80,16 +167,7 @@ class ProcurementPlanningReportView(APIView):
             .order_by("name")
         )
         if not materials:
-            return Response({
-                "kpis": {
-                    "critical_count": 0,
-                    "reorder_count": 0,
-                    "blocked_products_count": 0,
-                    "healthy_count": 0,
-                },
-                "categories": [],
-                "materials": [],
-            })
+            return Response(_empty_report_payload(threshold_days))
 
         material_ids = [m.id for m in materials]
 
@@ -133,14 +211,49 @@ class ProcurementPlanningReportView(APIView):
             for row in outflow_qs
         }
 
-        # ── 4. Per-material calculations (pure Python — no DB hits) ───────────
+        # ── 4. Batch: last OUT timestamp per material (dead-stock / idle days) ─
+        last_out_qs = (
+            StockTransaction.objects
+            .filter(
+                material_id__in=material_ids,
+                type=StockTransaction.TYPE_OUT,
+            )
+            .values("material_id")
+            .annotate(last_out_at=Max("created_at"))
+        )
+        last_out_map: dict[int, object] = {
+            row["material_id"]: row["last_out_at"]
+            for row in last_out_qs
+        }
+
+        recent_out_qs = (
+            StockTransaction.objects
+            .filter(
+                material_id__in=material_ids,
+                type=StockTransaction.TYPE_OUT,
+                created_at__gte=cutoff,
+            )
+            .values("material_id")
+            .annotate(recent_count=Count("pk"))
+        )
+        recent_out_set: set[int] = {
+            row["material_id"]
+            for row in recent_out_qs
+            if row["recent_count"]
+        }
+
+        # ── 5. Per-material calculations (pure Python — no DB hits) ───────────
         result_rows = []
         categories: set[str] = set()
+        deadstock_for_agg: list[dict] = []
 
         kpi_critical     = 0
         kpi_reorder      = 0   # CRITICAL + REORDER_SOON combined
         kpi_healthy      = 0
         blocked_products: set[int] = set()
+
+        critical_bottlenecks: list[dict] = []
+        idle_stock_warnings: list[dict] = []
 
         for mat in materials:
             current_stock  = float(mat.current_quantity or 0)
@@ -176,6 +289,31 @@ class ProcurementPlanningReportView(APIView):
                 reorder_point=reorder_point,
             )
 
+            # Dead stock / aging metrics
+            aging = _compute_aging_metrics(
+                current_stock=current_stock,
+                last_out_at=last_out_map.get(mat.id),
+                created_at=mat.created_at,
+                has_recent_out=mat.id in recent_out_set,
+                threshold_days=threshold_days,
+                cost_price=float(mat.cost_price or 0),
+                currency=mat.currency,
+                now=now,
+            )
+            if aging["is_dead_stock"]:
+                deadstock_for_agg.append({
+                    "currency": aging["currency"],
+                    "capital_tied": aging["capital_at_risk"],
+                })
+                idle_stock_warnings.append({
+                    "material_id": mat.id,
+                    "material_name": mat.name,
+                    "idle_days": aging["idle_days"],
+                    "aging_action": aging["aging_action"],
+                    "capital_at_risk": aging["capital_at_risk"],
+                    "currency": aging["currency"],
+                })
+
             # KPI accumulation
             if action_status == STATUS_CRITICAL:
                 kpi_critical += 1
@@ -207,6 +345,15 @@ class ProcurementPlanningReportView(APIView):
                 if action_status == STATUS_CRITICAL:
                     blocked_products.add(product.id)
 
+            if action_status == STATUS_CRITICAL and affected_products:
+                critical_bottlenecks.append({
+                    "material_id": mat.id,
+                    "material_name": mat.name,
+                    "blocked_products": [
+                        p["product_name"] for p in affected_products
+                    ],
+                })
+
             result_rows.append({
                 "material_id":       mat.id,
                 "material_name":     mat.name,
@@ -218,17 +365,33 @@ class ProcurementPlanningReportView(APIView):
                 "reorder_point":     reorder_point,
                 "daily_usage":       daily_usage,        # None → 'N/A' in UI
                 "days_left":         days_left,          # None → 'N/A' in UI
+                "idle_days":         aging["idle_days"],
+                "aging_action":      aging["aging_action"],
+                "is_dead_stock":     aging["is_dead_stock"],
+                "capital_at_risk":   aging["capital_at_risk"],
                 "action_status":     action_status,
                 "affected_products": affected_products,
             })
 
+        dead_stock_value_egp, _, dead_stock_breakdown = (
+            _aggregate_deadstock_capital(deadstock_for_agg)
+        )
+
         return Response({
             "kpis": {
-                "critical_count":        kpi_critical,
-                "reorder_count":         kpi_reorder,
+                "critical_count":         kpi_critical,
+                "reorder_count":          kpi_reorder,
                 "blocked_products_count": len(blocked_products),
                 "healthy_count":          kpi_healthy,
+                "dead_stock_value_egp":   round(dead_stock_value_egp, 2),
+                "dead_stock_count":       len(idle_stock_warnings),
+                "dead_stock_breakdown":   dead_stock_breakdown,
             },
+            "executive_summary": {
+                "critical_bottlenecks": critical_bottlenecks,
+                "idle_stock_warnings": idle_stock_warnings,
+            },
+            "dead_stock_threshold_days": threshold_days,
             "categories": sorted(categories),
             "materials":  result_rows,
         })
