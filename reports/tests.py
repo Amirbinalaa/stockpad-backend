@@ -97,12 +97,20 @@ class ProcurementPlanningReportTestCase(APITestCase):
                 performed_by=self.user,
             )
 
-        # Create Site B request on mat_healthy to verify allocated stock subtraction
+        # PENDING request counts toward allocated; APPROVED does not (Stock OUT
+        # already reduced current_stock on approval).
         MaterialRequest.objects.create(
             material=mat_healthy,
             requester_id="eng_01",
             requester_email="engineer@siteb.com",
             quantity=Decimal("50.00"),
+            status=MaterialRequest.STATUS_PENDING,
+        )
+        MaterialRequest.objects.create(
+            material=mat_healthy,
+            requester_id="eng_02",
+            requester_email="engineer2@siteb.com",
+            quantity=Decimal("30.00"),
             status=MaterialRequest.STATUS_APPROVED,
         )
 
@@ -147,7 +155,7 @@ class ProcurementPlanningReportTestCase(APITestCase):
         aluminum = materials_by_name["Aluminum Tube"]
         self.assertEqual(aluminum["action_status"], "REORDER_SOON")
 
-        # Verify Plastic Resin (Healthy with allocated stock)
+        # Verify Plastic Resin (Healthy — only PENDING counts as allocated)
         resin = materials_by_name["Plastic Resin"]
         self.assertEqual(resin["action_status"], "HEALTHY")
         self.assertEqual(resin["current_stock"], 500.0)

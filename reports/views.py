@@ -94,16 +94,14 @@ class ProcurementPlanningReportView(APIView):
         material_ids = [m.id for m in materials]
 
         # ── 2. Batch: allocated stock per material ─────────────────────────────
-        #   "Allocated" = sum of quantities from requests where status is
-        #   APPROVED or PENDING (the DB uses 'approved' / 'pending').
+        #   "Allocated" = sum of quantities from PENDING requests only.
+        #   APPROVED requests already trigger Stock OUT (deducted from current
+        #   stock), so including them here would double-deduct.
         allocated_qs = (
             MaterialRequest.objects
             .filter(
                 material_id__in=material_ids,
-                status__in=[
-                    MaterialRequest.STATUS_APPROVED,
-                    MaterialRequest.STATUS_PENDING,
-                ],
+                status=MaterialRequest.STATUS_PENDING,
             )
             .values("material_id")
             .annotate(total_allocated=Sum("quantity"))
