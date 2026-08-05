@@ -49,7 +49,7 @@ urlpatterns = [
     # Inventory
     path("api/inventory/", include("inventory.urls")),
     # Reports
-    path("api/reports/", include("reports.urls")),
+    path("api/reports/", include(("reports.urls", "reports"), namespace="reports")),
     # Notifications
     path("api/notifications/", include("notifications.urls")),
     # Settings

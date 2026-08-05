@@ -61,6 +61,12 @@ class Material(models.Model):
         blank=True,
         help_text="Alert when stock falls below this percentage.",
     )
+    reorder_point = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0.00,
+        help_text="Safety stock threshold — trigger reorder when available stock falls to or below this quantity.",
+    )
     cost_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     currency = models.CharField(
         max_length=3,
