@@ -49,6 +49,12 @@ class Material(models.Model):
         blank=True,
     )
     name = models.CharField(max_length=255)
+    category = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Optional explicit category; blank values are auto-inferred from the material name.",
+    )
     unit = models.CharField(max_length=10, choices=UNIT_CHOICES, default=UNIT_KG)
     current_quantity = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     max_quantity = models.DecimalField(

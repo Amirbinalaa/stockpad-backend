@@ -17,6 +17,7 @@ from rest_framework import permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from inventory.material_categories import resolve_material_category_name
 from inventory.models import Material, MaterialRequest, StockTransaction
 from inventory.views import (
     _aggregate_deadstock_capital,
@@ -261,8 +262,10 @@ class ProcurementPlanningReportView(APIView):
             allocated      = allocated_map.get(mat.id, 0.0)
             available      = max(0.0, current_stock - allocated)
 
-            # Category (derived from unit — mirrors serializers._UNIT_CATEGORY_MAP)
-            category_name  = _unit_to_category(mat.unit)
+            category_name = resolve_material_category_name(
+                name=mat.name,
+                explicit_category=getattr(mat, "category", None),
+            )
             categories.add(category_name)
 
             # Burn rate (daily usage)
@@ -401,12 +404,3 @@ class ProcurementPlanningReportView(APIView):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _unit_to_category(unit: str) -> str:
-    """Mirror the unit→category mapping used in inventory serializers."""
-    _MAP = {
-        "kg": "Raw Materials",
-        "L":  "Liquids & Chemicals",
-        "pcs": "Components & Parts",
-        "m":  "Structural Materials",
-    }
-    return _MAP.get(unit, "General Supplies")

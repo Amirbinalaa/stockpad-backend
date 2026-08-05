@@ -9,6 +9,12 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from .models import Material, StockTransaction, EngineerConnection
+from .material_categories import (
+    CATEGORY_BUILDING,
+    CATEGORY_STEEL,
+    infer_category_from_name,
+    resolve_material_category_name,
+)
 
 
 
@@ -460,6 +466,32 @@ class TeamAccessControlTests(TestCase):
 
 
 
+class MaterialCategoryInferenceTests(TestCase):
+    """Keyword-based category inference for uncategorized materials."""
+
+    def test_cement_infers_building_materials(self):
+        self.assertEqual(infer_category_from_name("Portland Cement"), CATEGORY_BUILDING)
+
+    def test_bolts_infers_steel_and_metal(self):
+        self.assertEqual(infer_category_from_name("Hex Bolts M8"), CATEGORY_STEEL)
+
+    def test_explicit_category_is_preserved(self):
+        self.assertEqual(
+            resolve_material_category_name(name="Random Item", explicit_category="Finishing"),
+            "Finishing",
+        )
+
+    def test_uncategorized_falls_back_to_inference(self):
+        self.assertEqual(
+            resolve_material_category_name(name="cement bag", explicit_category=""),
+            CATEGORY_BUILDING,
+        )
+        self.assertEqual(
+            resolve_material_category_name(name="cement bag", explicit_category="Uncategorized"),
+            CATEGORY_BUILDING,
+        )
+
+
 class EngineerPEApiTests(TestCase):
     """Site B catalog + connection check endpoints for PE clients."""
 
@@ -530,8 +562,8 @@ class EngineerPEApiTests(TestCase):
         self.assertEqual(item["quantity_available"], 150.0)
         self.assertEqual(item["current_quantity"], 150.0)
         self.assertEqual(item["stock_status"], "in_stock")
-        self.assertEqual(item["category_name"], "Raw Materials")
-        self.assertEqual(item["category"]["name"], "Raw Materials")
+        self.assertEqual(item["category_name"], "Building Materials")
+        self.assertEqual(item["category"]["name"], "Building Materials")
 
     def test_engineer_catalog_scoped_to_manager(self):
         url = reverse("inventory:material-catalog")

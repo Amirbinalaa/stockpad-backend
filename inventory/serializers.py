@@ -4,16 +4,8 @@ from decimal import Decimal
 from django.db import transaction as db_transaction
 from rest_framework import serializers
 
+from .material_categories import resolve_material_category_for_instance
 from .models import Material, StockTransaction, MaterialRequest, EngineerConnection, Product, ProductMaterial
-
-# Unit → PE catalog category (no DB category field on Material)
-_UNIT_CATEGORY_MAP = {
-    Material.UNIT_KG: (1, "Raw Materials"),
-    Material.UNIT_LITER: (2, "Liquids & Chemicals"),
-    Material.UNIT_PCS: (3, "Components & Parts"),
-    Material.UNIT_METER: (4, "Structural Materials"),
-}
-_DEFAULT_CATEGORY = (0, "General Supplies")
 
 
 def normalize_engineer_email(email):
@@ -34,8 +26,7 @@ def resolve_stock_status(material):
 
 
 def resolve_material_category(material):
-    cat_id, cat_name = _UNIT_CATEGORY_MAP.get(material.unit, _DEFAULT_CATEGORY)
-    return {"id": cat_id, "name": cat_name}, cat_name
+    return resolve_material_category_for_instance(material)
 
 
 def build_engineer_catalog_item(material):
@@ -59,11 +50,15 @@ def build_engineer_catalog_item(material):
 
 
 class MaterialSerializer(serializers.ModelSerializer):
+    resolved_category = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Material
         fields = [
             "id",
             "name",
+            "category",
+            "resolved_category",
             "unit",
             "current_quantity",
             "max_quantity",
@@ -77,7 +72,11 @@ class MaterialSerializer(serializers.ModelSerializer):
             "updated_at",
             "image",
         ]
-        read_only_fields = ["id", "current_quantity", "created_at", "updated_at"]
+        read_only_fields = ["id", "current_quantity", "created_at", "updated_at", "resolved_category"]
+
+    def get_resolved_category(self, obj):
+        _, name = resolve_material_category_for_instance(obj)
+        return name
 
 
 class MaterialCreateSerializer(serializers.ModelSerializer):
@@ -93,6 +92,7 @@ class MaterialCreateSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "name",
+            "category",
             "unit",
             "initial_quantity",
             "max_quantity",
@@ -311,7 +311,7 @@ class MaterialQuickCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Material
-        fields = ["id", "name", "unit", "initial_quantity", "current_quantity", "updated_at"]
+        fields = ["id", "name", "category", "unit", "initial_quantity", "current_quantity", "updated_at"]
         read_only_fields = ["id", "current_quantity", "updated_at"]
 
     def validate_name(self, value):

@@ -2,6 +2,7 @@ from decimal import Decimal
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
+from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -207,3 +208,38 @@ class ProcurementPlanningReportTestCase(APITestCase):
         self.assertEqual(len(idle_warnings), 1)
         self.assertEqual(idle_warnings[0]["material_name"], "Stale Resin Drum")
         self.assertEqual(idle_warnings[0]["aging_action"], "RELOCATE")
+
+    def test_uncategorized_materials_infer_category_in_report(self):
+        Material.objects.create(
+            user=self.user,
+            name="Portland Cement",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("50.00"),
+        )
+        Material.objects.create(
+            user=self.user,
+            name="Hex Bolts",
+            unit=Material.UNIT_PCS,
+            current_quantity=Decimal("200.00"),
+        )
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        by_name = {row["material_name"]: row for row in response.data["materials"]}
+        self.assertEqual(by_name["Portland Cement"]["category"], "Building Materials")
+        self.assertEqual(by_name["Hex Bolts"]["category"], "Steel & Metal")
+        self.assertIn("Building Materials", response.data["categories"])
+        self.assertIn("Steel & Metal", response.data["categories"])
+
+
+from reports.procurement_report_html import render_category_badge_html
+
+
+class ProcurementReportHtmlTests(TestCase):
+    def test_category_badge_renders_svg_and_styles(self):
+        html = render_category_badge_html("Building Materials")
+        self.assertIn('class="category-badge"', html)
+        self.assertIn('width="12"', html)
+        self.assertIn('height="12"', html)
+        self.assertIn("Building Materials", html)
