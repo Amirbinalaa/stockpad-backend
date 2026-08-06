@@ -1047,10 +1047,13 @@ class ProductListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         return (
             Product.objects
-            .all()
+            .filter(user=self.request.user)
             .prefetch_related("bom_lines__material")
             .order_by("-created_at")
         )
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
 
 
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -1066,7 +1069,7 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         return (
             Product.objects
-            .all()
+            .filter(user=self.request.user)
             .prefetch_related("bom_lines__material")
         )
 
@@ -1087,7 +1090,7 @@ class ProductBomView(APIView):
 
     def _get_product(self, request, pk):
         try:
-            return Product.objects.prefetch_related("bom_lines").get(pk=pk)
+            return Product.objects.prefetch_related("bom_lines").get(pk=pk, user=request.user)
         except Product.DoesNotExist:
             return None
 
@@ -1228,11 +1231,7 @@ class ImpliedDemandInsightView(APIView):
 
         # 4. Scope products query by request.user & status=active with prefetch_related('bom_lines__material')
         products_qs = (
-            Product.objects.filter(status=Product.STATUS_ACTIVE)
-            .filter(
-                models.Q(bom_lines__material__user=request.user) | models.Q(bom_lines__isnull=True)
-            )
-            .distinct()
+            Product.objects.filter(user=request.user, status=Product.STATUS_ACTIVE)
             .prefetch_related("bom_lines__material")
         )
 

@@ -255,8 +255,15 @@ class Product(models.Model):
         (STATUS_INACTIVE, "Inactive"),
     ]
 
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="products",
+        null=True,
+        blank=True,
+    )
     name = models.CharField(max_length=255)
-    sku = models.CharField(max_length=100, unique=True)
+    sku = models.CharField(max_length=100)
     category = models.CharField(max_length=100, blank=True)
     unit_of_measure = models.CharField(max_length=50)
     status = models.CharField(
@@ -272,9 +279,10 @@ class Product(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        unique_together = [("user", "sku")]
         indexes = [
-            models.Index(fields=["sku"]),
-            models.Index(fields=["status"]),
+            models.Index(fields=["user", "sku"]),
+            models.Index(fields=["user", "status"]),
         ]
 
     def __str__(self) -> str:
