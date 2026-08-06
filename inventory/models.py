@@ -329,4 +329,4 @@ def _catalog_invalidation_signal(sender, instance, **kwargs):
     except Exception:
         pass
 
-
+
