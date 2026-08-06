@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
+from django.core.cache import cache
 from django.urls import reverse
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -14,6 +15,7 @@ class AuthTests(TestCase):
     """
 
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
 
     def test_register_success(self):
@@ -44,7 +46,8 @@ class AuthTests(TestCase):
         resp = self.client.post(url, payload, format="json")
 
         self.assertEqual(resp.status_code, 400)
-        self.assertIn("password", resp.data)
+        errors = resp.data.get("errors", resp.data)
+        self.assertIn("password", errors)
 
     def _create_user(self, username="user1", password="pass123456", role="admin"):
         user = User(username=username, role=role)
@@ -186,3 +189,59 @@ class AuthTests(TestCase):
             format="json",
         )
         self.assertEqual(login_resp.status_code, 200)
+
+
+class AuthSecurityTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def test_forgot_password_missing_email_returns_400(self):
+        resp = self.client.post(reverse("users:forgot_password"), {}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+    def test_validation_error_has_uniform_shape(self):
+        url = reverse("users:register")
+        resp = self.client.post(
+            url,
+            {
+                "username": "x",
+                "email": "bad",
+                "password": "short",
+                "password2": "short",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+        self.assertIn("errors", resp.data)
+
+    def test_login_rate_limited(self):
+        from unittest.mock import patch
+
+        from users.views import LoginRateThrottle
+
+        cache.clear()
+        user = User(username="throttleuser", role="admin")
+        user.set_password("pass123456")
+        user.save()
+        url = reverse("users:login")
+
+        with patch.object(LoginRateThrottle, "get_rate", return_value="1/min"):
+            self.client.post(
+                url,
+                {"username": "throttleuser", "password": "wrong"},
+                format="json",
+            )
+            resp = self.client.post(
+                url,
+                {"username": "throttleuser", "password": "wrong"},
+                format="json",
+            )
+
+        self.assertEqual(resp.status_code, 429)
+        self.assertIn("detail", resp.data)
+
+    def tearDown(self):
+        cache.clear()

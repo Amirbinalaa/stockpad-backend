@@ -136,7 +136,8 @@ class InventoryTests(TestCase):
         }
         resp = self.client.post(url, payload, format="json")
         self.assertEqual(resp.status_code, 400)
-        self.assertIn("quantity", resp.data)
+        errors = resp.data.get("errors", resp.data)
+        self.assertIn("quantity", errors)
 
         mat.refresh_from_db()
         self.assertEqual(mat.current_quantity, Decimal("50.00"))
@@ -1021,7 +1022,8 @@ class ProductApiTests(TestCase):
         }
         response = self.client.post(url, data=payload, format="json")
         self.assertEqual(response.status_code, 400)
-        self.assertIn("bom_lines", response.data)
+        errors = response.data.get("errors", response.data)
+        self.assertIn("bom_lines", errors)
 
     def test_create_product_duplicate_sku_error(self):
         """POST /api/inventory/products/ with duplicate SKU returns 400."""
@@ -1087,7 +1089,8 @@ class ProductApiTests(TestCase):
         payload = {"name": "oak wood", "unit": "m"}
         response = self.client.post(url, data=payload, format="json")
         self.assertEqual(response.status_code, 400)
-        self.assertIn("name", response.data)
+        errors = response.data.get("errors", response.data)
+        self.assertIn("name", errors)
 
 
 # ---------------------------------------------------------------------------

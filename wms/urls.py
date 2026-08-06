@@ -23,12 +23,12 @@ from drf_spectacular.views import (
 )
 from django.conf import settings
 from django.conf.urls.static import static
-from rest_framework_simplejwt.views import TokenRefreshView
-
-from users.views import LoginView
+from users.views import LoginView, RefreshView
+from settings_app.views import HealthCheckView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/health/", HealthCheckView.as_view(), name="health-check"),
     # API schema and docs
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
     path(
@@ -43,7 +43,7 @@ urlpatterns = [
     ),
     # JWT Token endpoints
     path("api/token/", LoginView.as_view(), name="token_obtain_pair"),
-    path("api/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    path("api/token/refresh/", RefreshView.as_view(), name="token_refresh"),
     # Auth
     path("api/auth/", include("users.urls")),
     # Inventory

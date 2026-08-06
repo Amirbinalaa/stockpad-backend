@@ -9,12 +9,13 @@ from django.db import models
 from django.db import transaction as db_transaction
 from django.db.models import Sum
 from django.utils import timezone
-from rest_framework import generics, permissions, status, pagination, throttling
+from rest_framework import generics, permissions, status, throttling
 from rest_framework.response import Response
 from rest_framework.views import APIView
 import requests
 
 from settings_app.models import UserPreference
+from settings_app.pagination import StandardResultsSetPagination
 
 from .models import Material, StockTransaction, MaterialRequest, EngineerConnection, Product, ProductMaterial
 from .tasks import dispatch_webhook_async
@@ -35,12 +36,6 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class StandardResultsSetPagination(pagination.PageNumberPagination):
-    page_size = 20
-    page_size_query_param = "page_size"
-    max_page_size = 100
 
 
 class SiteBCatalogRateThrottle(throttling.SimpleRateThrottle):

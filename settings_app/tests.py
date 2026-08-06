@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
@@ -15,6 +16,7 @@ class SettingsTests(TestCase):
     """
 
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
         self.user = User.objects.create_user(
             username="setuser",
@@ -75,4 +77,27 @@ class SettingsTests(TestCase):
         anon = APIClient()
         resp = anon.get(reverse("settings_app:preferences"))
         self.assertEqual(resp.status_code, 401)
+
+
+class HealthCheckTests(TestCase):
+    def test_health_check_returns_200_with_db_probe(self):
+        resp = APIClient().get("/api/health/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "healthy")
+
+    def test_material_list_is_paginated(self):
+        client = APIClient()
+        user = User.objects.create_user(
+            username="pageuser", password="pass123456", role="admin"
+        )
+        login_resp = client.post(
+            "/api/auth/login/",
+            {"username": "pageuser", "password": "pass123456"},
+            format="json",
+        )
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {login_resp.data['access']}")
+        resp = client.get("/api/inventory/materials/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("results", resp.data)
+        self.assertIn("count", resp.data)
 

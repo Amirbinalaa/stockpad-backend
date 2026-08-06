@@ -160,20 +160,20 @@ REST_FRAMEWORK = {
         "user": "1000/day",
         "site_b_catalog": "60/minute",
         "site_b_request_create": "30/minute",
+        "login": "10/minute",
+        "password_reset": "5/minute",
+        "token_refresh": "30/minute",
     },
+    "DEFAULT_PAGINATION_CLASS": "settings_app.pagination.StandardResultsSetPagination",
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "EXCEPTION_HANDLER": "users.auth_utils.stockpad_exception_handler",
 }
-
-# Celery & Redis Task Queue Configuration
-CELERY_BROKER_URL = env("REDIS_URL", default="redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = env("REDIS_URL", default="redis://localhost:6379/0")
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-CELERY_TIMEZONE = TIME_ZONE
 
 import sys
 if "test" in sys.argv or getattr(sys, "_called_from_test", False):
+    REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["login"] = "1000/minute"
+    REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["password_reset"] = "1000/minute"
+    REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["token_refresh"] = "1000/minute"
     CELERY_TASK_ALWAYS_EAGER = True
     CELERY_TASK_EAGER_PROPAGATES = True
     CACHES = {
@@ -188,6 +188,14 @@ else:
             "LOCATION": env("REDIS_URL", default="redis://localhost:6379/0"),
         }
     }
+
+# Celery & Redis Task Queue Configuration
+CELERY_BROKER_URL = env("REDIS_URL", default="redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = env("REDIS_URL", default="redis://localhost:6379/0")
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = TIME_ZONE
 
 CELERY_BEAT_SCHEDULE = {
     "recompute-ai-insights-hourly": {

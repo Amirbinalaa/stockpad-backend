@@ -4,6 +4,7 @@ import re
 from typing import Optional, Tuple
 
 from django.core.files.base import ContentFile
+from rest_framework.views import exception_handler as drf_exception_handler
 
 DATA_URL_PATTERN = re.compile(
     r"^data:image/(?P<fmt>[a-zA-Z0-9+.-]+);base64,(?P<payload>.+)$",
@@ -49,3 +50,21 @@ def parse_data_url(data_url: str) -> Tuple[bytes, str]:
 def content_file_from_data_url(data_url: str, name_prefix: str = "profile") -> ContentFile:
     raw, ext = parse_data_url(data_url)
     return ContentFile(raw, name=f"{name_prefix}.{ext}")
+
+
+def stockpad_exception_handler(exc, context):
+    """Normalize all DRF error payloads to a consistent {"detail": ...} shape."""
+    response = drf_exception_handler(exc, context)
+    if response is None:
+        return None
+
+    data = response.data
+    if isinstance(data, dict):
+        if "detail" in data and "errors" not in data and len(data) == 1:
+            return response
+        if "detail" not in data:
+            response.data = {"detail": "Invalid request.", "errors": data}
+    elif isinstance(data, list):
+        response.data = {"detail": str(data[0]) if data else "Request failed."}
+
+    return response

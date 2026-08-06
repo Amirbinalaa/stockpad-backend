@@ -3,7 +3,7 @@ import os
 from urllib.parse import quote
 
 from django.contrib.auth import get_user_model
-from rest_framework import generics, permissions, status
+from rest_framework import generics, permissions, status, throttling
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -35,6 +35,18 @@ from .auth_utils import (
 
 
 User = get_user_model()
+
+
+class LoginRateThrottle(throttling.AnonRateThrottle):
+    scope = "login"
+
+
+class PasswordResetRateThrottle(throttling.AnonRateThrottle):
+    scope = "password_reset"
+
+
+class TokenRefreshRateThrottle(throttling.AnonRateThrottle):
+    scope = "token_refresh"
 
 
 def _apply_password_reset(user, new_password: str) -> None:
@@ -109,6 +121,7 @@ class ChangePasswordView(APIView):
 class LoginView(TokenObtainPairView):
     """JWT login with optional remember_me (1-hour session)."""
     serializer_class = StockPadTokenObtainPairSerializer
+    throttle_classes = [LoginRateThrottle]
 
     def post(self, request, *args, **kwargs):
         if request.data.get("credential"):
@@ -117,9 +130,8 @@ class LoginView(TokenObtainPairView):
 
 
 class RefreshView(TokenRefreshView):
-    """
-    JWT token refresh view.
-    """
+    """JWT token refresh view."""
+    throttle_classes = [TokenRefreshRateThrottle]
 
 
 class ProfileView(generics.RetrieveUpdateAPIView):
@@ -210,6 +222,7 @@ class LogoutView(APIView):
 
 class ForgotPasswordView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [PasswordResetRateThrottle]
 
     def post(self, request):
         email = (request.data.get("email") or "").strip()
@@ -251,6 +264,7 @@ class ForgotPasswordView(APIView):
 
 class ResetPasswordView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [PasswordResetRateThrottle]
 
     def post(self, request):
         uid = request.data.get('uid')
@@ -291,6 +305,7 @@ class ResetPasswordView(APIView):
 
 class ResetPasswordConfirmView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [PasswordResetRateThrottle]
 
     def post(self, request):
         email = normalize_reset_email(request.data.get("email"))

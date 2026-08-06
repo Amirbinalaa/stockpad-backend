@@ -53,7 +53,7 @@ class NotificationTests(TestCase):
         self._create_notifications()
         resp = self.client.get(reverse("notifications:list"))
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(resp.data), 3)
+        self.assertEqual(len(resp.data["results"]), 3)
 
     def test_list_notifications_filtered_by_category(self):
         """Filter notifications by category query param."""
@@ -63,16 +63,16 @@ class NotificationTests(TestCase):
             reverse("notifications:list") + "?category=alert"
         )
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(resp.data), 1)
-        self.assertEqual(resp.data[0]["category"], "alert")
+        self.assertEqual(len(resp.data["results"]), 1)
+        self.assertEqual(resp.data["results"][0]["category"], "alert")
 
         # Plural category (backward compatibility check)
         resp2 = self.client.get(
             reverse("notifications:list") + "?category=alerts"
         )
         self.assertEqual(resp2.status_code, 200)
-        self.assertEqual(len(resp2.data), 1)
-        self.assertEqual(resp2.data[0]["category"], "alert")
+        self.assertEqual(len(resp2.data["results"]), 1)
+        self.assertEqual(resp2.data["results"][0]["category"], "alert")
 
     def test_summary_counts_unread(self):
         """Summary returns counts of unread notifications by category."""
