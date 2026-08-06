@@ -1,24 +1,35 @@
-# Python
+# Python & Byte-compiled files
 __pycache__/
 *.py[cod]
+*$py.class
 *.pyo
 *.pyd
 
-# Virtual environment
+# Environments
 venv/
 env/
+.venv/
 
-# Environment variables (NEVER commit this)
+# Environment Variables & Secrets (CRITICAL)
 .env
+*.env
 
-# Django
+# Django specific
 *.log
 db.sqlite3
 staticfiles/
+media/
+BackEnd/media/
 
-# VS Code
+# IDEs & AI Tools
 .vscode/
+.cursor/
 
-# Windows
+# OS Generated
 Thumbs.db
 desktop.ini
+.DS_Store
+
+# Documentation / Internal specs (Optional - only if private)
+docs/
+AGENT/
