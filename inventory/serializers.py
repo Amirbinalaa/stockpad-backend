@@ -296,8 +296,8 @@ class MaterialQuickCreateSerializer(serializers.ModelSerializer):
     MaterialCreateSerializer is NOT modified — this class is isolated.
 
     Differences from MaterialCreateSerializer:
-    - initial_quantity is optional (defaults to 0.00) — the user did not
-      come from the main Add Material flow, so stock tracking starts at zero.
+    - initial_quantity is optional (defaults to 0.00) — stock tracking starts at zero if omitted.
+    - Accepts full material details (cost_price, currency, max_quantity, threshold, image, costing_method).
     - Validates name uniqueness case-insensitively per user to prevent
       duplicates that only differ by casing.
     """
@@ -308,11 +308,32 @@ class MaterialQuickCreateSerializer(serializers.ModelSerializer):
         write_only=True,
         default=Decimal("0.00"),
     )
+    resolved_category = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Material
-        fields = ["id", "name", "category", "unit", "initial_quantity", "current_quantity", "updated_at"]
-        read_only_fields = ["id", "current_quantity", "updated_at"]
+        fields = [
+            "id",
+            "name",
+            "category",
+            "resolved_category",
+            "unit",
+            "initial_quantity",
+            "current_quantity",
+            "max_quantity",
+            "low_stock_threshold_percent",
+            "reorder_point",
+            "cost_price",
+            "currency",
+            "costing_method",
+            "image",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "current_quantity", "updated_at", "resolved_category"]
+
+    def get_resolved_category(self, obj):
+        _, name = resolve_material_category_for_instance(obj)
+        return name
 
     def validate_name(self, value):
         value = value.strip()
