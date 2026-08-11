@@ -56,6 +56,12 @@ def ping_site_b_health(webhook_url: str) -> bool:
     - Target URL Path: GET /api/v1/health/
     - Headers: X-Site-B-API-Key
     - Expected Response: HTTP 200 OK with {"status": "healthy"} or {"status": "ok"}
+
+    NOTE (Task #2 — 2026-08-11): This function is no longer called by send_webhook_task.
+    The preflight ping block was removed because it added up to 3 s of blocking wait
+    before any real work, stalling half the worker pool at concurrency=2.
+    This function is RETAINED (not deleted) pending a separate explicit confirmation.
+    DO NOT remove without a dedicated session decision.
     """
     try:
         parsed = urlparse(webhook_url)
@@ -142,26 +148,24 @@ def send_webhook_task(self, webhook_url: str, payload: dict) -> bool:
     Writes a WebhookDeliveryLog dead-letter record if all retries are exhausted.
     Phase 5: increments the retry spike counter on every retry attempt and emits
     a CRITICAL alert when the rolling hourly count exceeds WEBHOOK_RETRY_SPIKE_THRESHOLD.
+
+    Task #2 changes (2026-08-11):
+    - Preflight ping (ping_site_b_health) removed: was adding up to 3 s of blocking
+      wait before any real work, stalling half the worker pool at concurrency=2.
+    - Timeout tightened to (1.5, 3): 1.5 s connect / 3 s read.
+    - res.raise_for_status() added (intentional scope addition, approved): previously
+      any 4xx/5xx response from Site B was logged as 'Delivered' with no retry, no
+      spike tracking, no dead-letter — silently treated as success. raise_for_status()
+      promotes those into requests.HTTPError, which is a subclass of RequestException,
+      so they now funnel through the single except block below for proper retry,
+      spike tracking, and dead-letter handling.
+    - Spike tracking / dead-letter preserved: _increment_retry_counter(),
+      _emit_spike_alert(), and _write_dead_letter() all still fire correctly;
+      connection failures, timeouts, and HTTP error statuses are now consolidated
+      into the single except requests.RequestException block.
     """
     if not webhook_url:
         return False
-
-    if not ping_site_b_health(webhook_url):
-        error_msg = f"Site B health check failed for {webhook_url}"
-        logger.warning("[WM Webhook Celery] %s — retrying (attempt %s)", error_msg, self.request.retries + 1)
-        # ── Spike tracking: count every retry attempt, alert if threshold crossed ──
-        retry_count = _increment_retry_counter()
-        threshold = getattr(settings, "WEBHOOK_RETRY_SPIKE_THRESHOLD", 5)
-        if retry_count >= threshold:
-            _emit_spike_alert(retry_count)
-        try:
-            raise self.retry(exc=Exception(error_msg))
-        except (self.MaxRetriesExceededError, Exception) as exc:
-            # If max retries reached or called synchronously in eager mode where retry re-raises
-            if self.request.retries >= self.max_retries or isinstance(exc, self.MaxRetriesExceededError):
-                _write_dead_letter(webhook_url, payload, error_msg, self.max_retries)
-                return False
-            raise
 
     body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = _build_webhook_headers(payload)
@@ -171,16 +175,21 @@ def send_webhook_task(self, webhook_url: str, payload: dict) -> bool:
             webhook_url,
             data=body_bytes,
             headers=headers,
-            timeout=5,
+            # 1.5 s connect timeout / 3 s read timeout (Task #2)
+            timeout=(1.5, 3),
         )
+        # Raise requests.HTTPError for 4xx/5xx responses so they are retried
+        # and dead-lettered instead of being silently treated as success (Task #2)
+        res.raise_for_status()
         logger.info(
             "[WM Webhook Celery] Delivered payload %s to %s -> HTTP %s",
             payload,
             webhook_url,
-            getattr(res, "status_code", "200"),
+            res.status_code,
         )
         return True
     except requests.RequestException as exc:
+        # Handles: connection errors, timeouts, and HTTP 4xx/5xx (via raise_for_status)
         logger.error(
             "[WM Webhook Celery] Failed to deliver webhook payload %s to %s: %s (attempt %s)",
             payload,
@@ -188,7 +197,7 @@ def send_webhook_task(self, webhook_url: str, payload: dict) -> bool:
             exc,
             self.request.retries + 1,
         )
-        # ── Spike tracking on HTTP-level delivery failure ──────────────────────
+        # ── Spike tracking: count every retry attempt, alert if threshold crossed ──
         retry_count = _increment_retry_counter()
         threshold = getattr(settings, "WEBHOOK_RETRY_SPIKE_THRESHOLD", 5)
         if retry_count >= threshold:
@@ -196,6 +205,7 @@ def send_webhook_task(self, webhook_url: str, payload: dict) -> bool:
         try:
             raise self.retry(exc=exc)
         except self.MaxRetriesExceededError:
+            # All 3 retries exhausted — write to dead-letter log
             _write_dead_letter(webhook_url, payload, str(exc), self.max_retries)
             return False
 

@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+import requests
 from django.conf import settings
 from django.core.cache import cache
 from django.contrib.auth import get_user_model
@@ -237,10 +238,11 @@ class MaterialRequestWebhookTests(TestCase):
             is_active=True,
         )
 
-    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_create_material_request_success_and_webhook(self, mock_post, mock_health):
-        """Site B can create request using API key. Webhook is sent. Fallback user assigned."""
+    def test_create_material_request_success_and_webhook(self, mock_post):
+        """Site B can create request using API key. Webhook is sent. Fallback user assigned.
+        Task #2 (2026-08-11): ping_site_b_health mock removed — preflight no longer exists.
+        """
         url = reverse("inventory:request-create")
         payload = {
             "material": self.material.id,
@@ -270,10 +272,11 @@ class MaterialRequestWebhookTests(TestCase):
         self.assertEqual(call_kwargs[0][0], "https://site-b.com/webhooks/requests/")
         self.assertIn("X-Site-A-Signature", call_kwargs[1]["headers"])
 
-    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_create_material_request_fallback_superuser(self, mock_post, mock_health):
-        """If requester_email is not found, fallback to superuser (admin)."""
+    def test_create_material_request_fallback_superuser(self, mock_post):
+        """If requester_email is not found, fallback to superuser (admin).
+        Task #2 (2026-08-11): ping_site_b_health mock removed — preflight no longer exists.
+        """
         # Clear owner of material for test
         self.material.user = None
         self.material.save()
@@ -295,10 +298,11 @@ class MaterialRequestWebhookTests(TestCase):
         self.material.refresh_from_db()
         self.assertEqual(self.material.user, self.superuser)
 
-    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_review_material_request_webhook(self, mock_post, mock_health):
-        """Approving request triggers second webhook with approved status."""
+    def test_review_material_request_webhook(self, mock_post):
+        """Approving request triggers second webhook with approved status.
+        Task #2 (2026-08-11): ping_site_b_health mock removed — preflight no longer exists.
+        """
         req = MaterialRequest.objects.create(
             material=self.material,
             requester_id="eng-123",
@@ -335,9 +339,24 @@ class MaterialRequestWebhookTests(TestCase):
         self.assertEqual(call_kwargs[0][0], "https://site-b.com/webhooks/requests/")
         self.assertIn("X-Site-A-Signature", call_kwargs[1]["headers"])
 
-    @patch("inventory.tasks.ping_site_b_health", return_value=False)
-    def test_webhook_retry_exhaustion_creates_dead_letter_log(self, mock_health):
-        """When health check fails on all attempts, task exhausts retries and creates a WebhookDeliveryLog record."""
+    @patch("requests.post", side_effect=requests.ConnectionError("Connection refused"))
+    def test_webhook_retry_exhaustion_creates_dead_letter_log(self, mock_post):
+        """When requests.post raises ConnectionError and retries are exhausted,
+        _write_dead_letter is called and a WebhookDeliveryLog record is created.
+
+        Task #2 (2026-08-11): Reworked from ping_site_b_health mock to a
+        requests.post ConnectionError — the preflight path no longer exists.
+        Failure is now driven by the single except requests.RequestException
+        handler (connection errors, timeouts, and 4xx/5xx via raise_for_status
+        all funnel here). The error_message stored in the dead-letter record
+        is the str() of the raised exception.
+
+        Celery 5 eager-mode note: in eager apply(), self.retry() propagates the
+        original exception rather than raising MaxRetriesExceededError through
+        the task body, so we patch task.retry directly to raise
+        MaxRetriesExceededError and simulate the exhaustion path explicitly.
+        """
+        from celery.exceptions import MaxRetriesExceededError
         from .models import WebhookDeliveryLog
         from .tasks import send_webhook_task
 
@@ -348,11 +367,13 @@ class MaterialRequestWebhookTests(TestCase):
             "event_id": "11111111-2222-3333-4444-555555555555",
         }
 
-        # Call apply with retries at max_retries to trigger MaxRetriesExceeded handling
-        try:
-            send_webhook_task.apply(args=[webhook_url, payload], retries=3)
-        except Exception:
-            pass
+        # Patch task.retry to raise MaxRetriesExceededError immediately,
+        # simulating what happens in production when all 3 retries are spent.
+        with patch.object(send_webhook_task, "retry", side_effect=MaxRetriesExceededError()):
+            try:
+                send_webhook_task.apply(args=[webhook_url, payload])
+            except Exception:
+                pass
 
         # Assert WebhookDeliveryLog was created with correct fields
         log = WebhookDeliveryLog.objects.filter(webhook_url=webhook_url).first()
@@ -361,9 +382,81 @@ class MaterialRequestWebhookTests(TestCase):
         self.assertEqual(str(log.event_id), "11111111-2222-3333-4444-555555555555")
         self.assertEqual(log.attempt_count, 3)
         self.assertEqual(log.status, WebhookDeliveryLog.STATUS_FAILED)
-        self.assertIn("Site B health check failed", log.error_message)
+        # Error message is the str() of the ConnectionError raised by mock_post
+        self.assertIn("Connection refused", log.error_message)
 
 
+
+    def test_material_request_summary_counts_and_user_isolation(self):
+        """Test GET /api/inventory/material-requests/summary/ returns accurate counts,
+        includes all status keys even when count is 0 (e.g. 0 denied), and enforces user isolation.
+        """
+        # User A setup (self.user)
+        login_resp = self.client.post(
+            "/api/auth/login/",
+            {"username": "testuser", "password": "userpass123"},
+            format="json",
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {login_resp.data['access']}")
+        material_a = Material.objects.create(user=self.user, name="Cement A", unit="kg", current_quantity=Decimal("100"))
+
+        # User A has 2 pending and 1 approved request (0 denied)
+        MaterialRequest.objects.create(
+            material=material_a,
+            requester_id="eng-1",
+            requester_email="eng1@example.com",
+            quantity=Decimal("10.0"),
+            status="pending",
+        )
+        MaterialRequest.objects.create(
+            material=material_a,
+            requester_id="eng-2",
+            requester_email="eng2@example.com",
+            quantity=Decimal("15.0"),
+            status="pending",
+        )
+        MaterialRequest.objects.create(
+            material=material_a,
+            requester_id="eng-3",
+            requester_email="eng3@example.com",
+            quantity=Decimal("20.0"),
+            status="approved",
+        )
+
+        # User B setup
+        user_b = User.objects.create_user(username="user_b", password="userpass456", email="user_b@example.com")
+        material_b = Material.objects.create(user=user_b, name="Bricks B", unit="pcs", current_quantity=Decimal("100"))
+        MaterialRequest.objects.create(
+            material=material_b,
+            requester_id="eng-4",
+            requester_email="eng4@example.com",
+            quantity=Decimal("5.0"),
+            status="denied",
+        )
+
+        # GET summary as User A
+        url = reverse("inventory:request-summary")
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["pending"], 2)
+        self.assertEqual(resp.data["approved"], 1)
+        self.assertEqual(resp.data["denied"], 0)
+        self.assertEqual(resp.data["total"], 3)
+        self.assertIn("denied", resp.data)
+
+        # GET summary as User B
+        login_resp_b = self.client.post(
+            "/api/auth/login/",
+            {"username": "user_b", "password": "userpass456"},
+            format="json",
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {login_resp_b.data['access']}")
+        resp_b = self.client.get(url)
+        self.assertEqual(resp_b.status_code, 200)
+        self.assertEqual(resp_b.data["pending"], 0)
+        self.assertEqual(resp_b.data["approved"], 0)
+        self.assertEqual(resp_b.data["denied"], 1)
+        self.assertEqual(resp_b.data["total"], 1)
 
 
 class TeamAccessControlTests(TestCase):
@@ -436,9 +529,9 @@ class TeamAccessControlTests(TestCase):
         self.assertEqual(resp.data["engineer_email"], "engineer1@example.com")
         self.assertTrue(resp.data["is_active"])
 
-    @patch("inventory.tasks.ping_site_b_health", return_value=True)
     @patch("requests.post")
-    def test_request_creation_security_enforcement(self, mock_post, mock_health):
+    def test_request_creation_security_enforcement(self, mock_post):
+        # Task #2 (2026-08-11): ping_site_b_health mock removed — preflight no longer exists.
         # 1. Attempt request submission without active connection (fails with 403)
         url = reverse("inventory:request-create")
         payload = {
@@ -655,6 +748,126 @@ class Phase4CachingTests(TestCase):
         self.assertIn("Recomputed AI insights", task_result)
         refreshed_cache = cache.get(cache_key)
         self.assertIsNotNone(refreshed_cache)
+
+    def test_compute_ai_insights_query_count(self):
+        """Assert compute_ai_insights_for_user executes in exactly 5 DB queries."""
+        from inventory.views import compute_ai_insights_for_user
+        from settings_app.models import UserPreference
+        cache.clear()
+        UserPreference.objects.get_or_create(user=self.user)
+        
+        # Create 10 materials to verify query count is constant (not O(N))
+        for i in range(10):
+            Material.objects.create(
+                user=self.user,
+                name=f"Test Material {i}",
+                unit=Material.UNIT_KG,
+                current_quantity=Decimal("50.00"),
+                cost_price=Decimal("5.00"),
+                is_active=True,
+            )
+
+        # compute_ai_insights_for_user uses exactly 5 DB queries (Q1-Q5) regardless of catalog size
+        with self.assertNumQueries(5):
+            data = compute_ai_insights_for_user(self.user)
+
+        self.assertIn("deadstock", data)
+        self.assertIn("predictions", data)
+        self.assertIn("metrics", data)
+        self.assertIn("charts", data)
+
+    def test_compute_ai_insights_four_edge_cases(self):
+        """Explicitly test all 4 edge cases for compute_ai_insights_for_user."""
+        from inventory.views import compute_ai_insights_for_user
+        from settings_app.models import UserPreference
+        cache.clear()
+
+        # Case A: Material with qty = 0
+        mat_zero_qty = Material.objects.create(
+            user=self.user,
+            name="Zero Qty Material",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("0.00"),
+            cost_price=Decimal("10.00"),
+            is_active=True,
+        )
+
+        # Case B: Material with zero transactions ever (created 60 days ago)
+        mat_no_tx = Material.objects.create(
+            user=self.user,
+            name="No Tx Material",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("50.00"),
+            cost_price=Decimal("10.00"),
+            is_active=True,
+        )
+        Material.objects.filter(pk=mat_no_tx.pk).update(
+            created_at=timezone.now() - timezone.timedelta(days=60)
+        )
+
+        # Case C: Material with last OUT < 90 days ago (15 days ago)
+        mat_recent_out = Material.objects.create(
+            user=self.user,
+            name="Recent Out Material",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("100.00"),
+            cost_price=Decimal("15.00"),
+            is_active=True,
+        )
+        st_recent = StockTransaction.objects.create(
+            material=mat_recent_out,
+            type=StockTransaction.TYPE_OUT,
+            quantity=Decimal("20.00"),
+            performed_by=self.user,
+        )
+        StockTransaction.objects.filter(pk=st_recent.pk).update(
+            created_at=timezone.now() - timezone.timedelta(days=15)
+        )
+
+        # Case D: User with threshold_days > 90 (120 days), OUT transaction 100 days ago
+        user_120 = User.objects.create_user(
+            username="user120", password="pass123456", role="admin"
+        )
+        UserPreference.objects.create(user=user_120, dead_stock_threshold_days=120)
+        mat_120 = Material.objects.create(
+            user=user_120,
+            name="Material Threshold 120",
+            unit=Material.UNIT_KG,
+            current_quantity=Decimal("80.00"),
+            cost_price=Decimal("20.00"),
+            is_active=True,
+        )
+        st_120 = StockTransaction.objects.create(
+            material=mat_120,
+            type=StockTransaction.TYPE_OUT,
+            quantity=Decimal("10.00"),
+            performed_by=user_120,
+        )
+        StockTransaction.objects.filter(pk=st_120.pk).update(
+            created_at=timezone.now() - timezone.timedelta(days=100)
+        )
+
+        # Execute insights for main user (Cases A, B, C)
+        data = compute_ai_insights_for_user(self.user)
+        deadstock_ids = [d["material_id"] for d in data["deadstock"]]
+        deadstock_by_id = {d["material_id"]: d for d in data["deadstock"]}
+
+        # Assert Case A: qty=0 is NOT in deadstock
+        self.assertNotIn(mat_zero_qty.id, deadstock_ids)
+
+        # Assert Case B: no tx ever -> in deadstock with last_out_date == None
+        self.assertIn(mat_no_tx.id, deadstock_ids)
+        self.assertIsNone(deadstock_by_id[mat_no_tx.id]["last_out_date"])
+
+        # Assert Case C: recent OUT (15 days ago) is NOT in deadstock
+        self.assertNotIn(mat_recent_out.id, deadstock_ids)
+
+        # Execute insights for user_120 (Case D: threshold_days=120, OUT at 100 days ago)
+        data_120 = compute_ai_insights_for_user(user_120)
+        deadstock_ids_120 = [d["material_id"] for d in data_120["deadstock"]]
+
+        # Assert Case D: OUT at 100 days ago falls inside 120d threshold window -> has_out_in_window is True -> NOT in deadstock
+        self.assertNotIn(mat_120.id, deadstock_ids_120)
 
     def test_material_catalog_caching_and_invalidation(self):
         url = reverse("inventory:material-catalog")

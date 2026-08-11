@@ -7,7 +7,7 @@ import uuid
 from django.conf import settings
 from django.db import models
 from django.db import transaction as db_transaction
-from django.db.models import Sum
+from django.db.models import Count, Max, Q, Sum
 from django.utils import timezone
 from rest_framework import generics, permissions, status, throttling
 from rest_framework.response import Response
@@ -372,6 +372,25 @@ class MaterialRequestListView(generics.ListAPIView):
         return queryset
 
 
+class MaterialRequestSummaryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        counts_qs = (
+            MaterialRequest.objects.filter(material__user=request.user)
+            .values("status")
+            .annotate(total=Count("id"))
+        )
+        counts = {"pending": 0, "approved": 0, "denied": 0, "total": 0}
+        for item in counts_qs:
+            st = item["status"]
+            cnt = item["total"]
+            if st in counts:
+                counts[st] = cnt
+            counts["total"] += cnt
+        return Response(counts)
+
+
 class MaterialRequestReviewView(generics.UpdateAPIView):
     serializer_class = MaterialRequestReviewSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -656,58 +675,125 @@ def _normalize_sparkline(values, count=5):
 
 
 def _build_weekly_out_totals(user, weeks=12):
-    totals = []
+    """
+    Returns ``weeks`` weekly OUT-quantity totals ordered oldest → newest.
+
+    Replaces the previous N-query loop with a single DB roundtrip via
+    conditional aggregation.  Bucket boundaries are identical to the original
+    (7-day windows anchored to ``now``, not calendar weeks), so output values
+    are unchanged.  Q5 in the compute_ai_insights_for_user query plan.
+    """
     now = timezone.now()
+
+    # Build one conditional Sum() per weekly bucket.
+    # Keys are "w{i}" where i=weeks (oldest) … i=1 (newest: [now-1w, now)).
+    agg_kwargs = {}
+    week_keys = []
     for i in range(weeks, 0, -1):
         start = now - timezone.timedelta(weeks=i)
         end = now - timezone.timedelta(weeks=i - 1)
-        agg = (
-            StockTransaction.objects.filter(
-                material__user=user,
-                type=StockTransaction.TYPE_OUT,
-                created_at__gte=start,
-                created_at__lt=end,
-            ).aggregate(total=Sum("quantity"))
+        key = f"w{i}"
+        agg_kwargs[key] = Sum(
+            "quantity",
+            filter=Q(created_at__gte=start, created_at__lt=end),
         )
-        totals.append(float(agg["total"] or 0))
-    return totals
+        week_keys.append(key)
+
+    result = StockTransaction.objects.filter(
+        material__user=user,
+        type=StockTransaction.TYPE_OUT,
+        created_at__gte=now - timezone.timedelta(weeks=weeks),
+    ).aggregate(**agg_kwargs)
+
+    return [float(result.get(k) or 0) for k in week_keys]
 
 
 def compute_ai_insights_for_user(user):
     """
     Computes deadstock alerts, demand predictions, throughput metrics,
     and forecast charts for a specific user without caching.
-    """
-    threshold_days, threshold_value, threshold_unit = _resolve_dead_stock_threshold(user)
 
-    materials = Material.objects.filter(user=user, is_active=True)
+    Query plan — 5 fixed DB roundtrips regardless of catalogue size:
+      Q1  UserPreference via _resolve_dead_stock_threshold
+      Q2  Material.filter(user, is_active=True)  — evaluated once with list()
+      Q3  StockTransaction GROUP BY material_id — conditional Sum/Count for
+          demand windows (30/60/90d), deadstock signal, and 7-day accuracy actuals
+      Q4  StockTransaction unbounded MAX(created_at) per material — correct
+          latest-OUT date for the dead-stock inactive-since calculation
+      Q5  _build_weekly_out_totals — 12-week throughput in one aggregate()
+    """
+    threshold_days, threshold_value, threshold_unit = _resolve_dead_stock_threshold(user)  # Q1
+
+    # Q2 — evaluate immediately; list() prevents a second SQL hit at the former
+    # `list(materials)` call that existed after the loop.
+    materials = list(Material.objects.filter(user=user, is_active=True))
+
     now = timezone.now()
     cutoff = now - timezone.timedelta(days=threshold_days)
     day_30 = now - timezone.timedelta(days=30)
     day_60 = now - timezone.timedelta(days=60)
     day_90 = now - timezone.timedelta(days=90)
+    week_ago = now - timezone.timedelta(days=7)
+
+    material_ids = [m.id for m in materials]
+
+    # When threshold_days > 90 the dead-stock window extends further back than
+    # 90 days.  lower_bound is the earlier of the two so the outer filter never
+    # clips transactions that has_out_in_window needs to inspect.
+    lower_bound = min(cutoff, day_90)
+
+    # Q3 — single GROUP BY replaces:
+    #   • per-material loop query A  (.exists() dead-stock check)
+    #   • per-material loop query C  (90-day OUT list for demand windows)
+    #   • per-prediction post-loop query D  (7-day actuals for accuracy)
+    tx_agg_rows = (
+        StockTransaction.objects.filter(
+            material_id__in=material_ids,
+            type=StockTransaction.TYPE_OUT,
+            created_at__gte=lower_bound,
+        )
+        .values("material_id")
+        .annotate(
+            qty_30=Sum("quantity", filter=Q(created_at__gte=day_30)),
+            qty_60=Sum("quantity", filter=Q(created_at__gte=day_60, created_at__lt=day_30)),
+            qty_90=Sum("quantity", filter=Q(created_at__gte=day_90, created_at__lt=day_60)),
+            has_out_in_window=Count("id", filter=Q(created_at__gte=cutoff)),
+            actual_week=Sum("quantity", filter=Q(created_at__gte=week_ago)),
+        )
+    )
+    tx_agg_map = {row["material_id"]: row for row in tx_agg_rows}
+
+    # Q4 — unbounded MAX: replicates loop query B
+    #   (.filter(type=OUT).order_by("-created_at").first())
+    # across all materials in one shot.  Must be unbounded — a material whose
+    # last OUT is older than lower_bound would return None from Q3's Max,
+    # producing a wrong inactive_since for exactly the dead-stock cases this
+    # feature targets.
+    latest_out_rows = (
+        StockTransaction.objects.filter(
+            material_id__in=material_ids,
+            type=StockTransaction.TYPE_OUT,
+        )
+        .values("material_id")
+        .annotate(latest_out_date=Max("created_at"))
+    )
+    latest_out_map = {row["material_id"]: row["latest_out_date"] for row in latest_out_rows}
 
     deadstock_list = []
     predictions_list = []
 
     for m in materials:
+        agg = tx_agg_map.get(m.id, {})
+        has_out_in_window = bool(agg.get("has_out_in_window") or 0)
+
         # --- Dead Stock: qty > 0 and zero OUT transactions inside threshold window ---
         if float(m.current_quantity or 0) <= 0:
             pass
         else:
-            has_out_in_window = m.transactions.filter(
-                type=StockTransaction.TYPE_OUT,
-                created_at__gte=cutoff,
-            ).exists()
-
             if not has_out_in_window:
-                latest_out = (
-                    m.transactions.filter(type=StockTransaction.TYPE_OUT)
-                    .order_by("-created_at")
-                    .first()
-                )
-                if latest_out and latest_out.created_at:
-                    inactive_since = latest_out.created_at
+                latest_out_date = latest_out_map.get(m.id)
+                if latest_out_date:
+                    inactive_since = latest_out_date
                 elif m.created_at:
                     inactive_since = m.created_at
                 else:
@@ -728,9 +814,7 @@ def compute_ai_insights_for_user(user):
                     "sku": f"SKU-{m.id:04d}",
                     "material_name": m.name,
                     "last_out_date": (
-                        latest_out.created_at.isoformat()
-                        if latest_out and latest_out.created_at
-                        else None
+                        latest_out_date.isoformat() if latest_out_date else None
                     ),
                     "created_at": (
                         m.created_at.isoformat() if m.created_at else None
@@ -754,15 +838,13 @@ def compute_ai_insights_for_user(user):
                 })
 
         # --- Demand Prediction Logic ---
-        transactions_out = list(m.transactions.filter(type=StockTransaction.TYPE_OUT, created_at__gte=day_90))
-        
-        qty_30 = sum(t.quantity for t in transactions_out if t.created_at and t.created_at >= day_30)
-        qty_60 = sum(t.quantity for t in transactions_out if t.created_at and day_30 > t.created_at >= day_60)
-        qty_90 = sum(t.quantity for t in transactions_out if t.created_at and day_60 > t.created_at >= day_90)
+        qty_30 = float(agg.get("qty_30") or 0)
+        qty_60 = float(agg.get("qty_60") or 0)
+        qty_90 = float(agg.get("qty_90") or 0)
 
-        adc_30 = float(qty_30) / 30.0
-        adc_60 = float(qty_60) / 30.0
-        adc_90 = float(qty_90) / 30.0
+        adc_30 = qty_30 / 30.0
+        adc_60 = qty_60 / 30.0
+        adc_90 = qty_90 / 30.0
 
         prior_avg = (adc_60 + adc_90) / 2.0
 
@@ -809,8 +891,7 @@ def compute_ai_insights_for_user(user):
             "low_stock_threshold_percent": m.low_stock_threshold_percent or 30,
         })
 
-    materials_list = list(materials)
-    active_count = len(materials_list) or 1
+    active_count = len(materials) or 1
 
     predicted_throughput = sum(p["adc_30"] * 30 for p in predictions_list)
     prior_throughput = sum(p["prior_avg"] * 30 for p in predictions_list)
@@ -822,7 +903,7 @@ def compute_ai_insights_for_user(user):
         throughput_trend_pct = 100.0 if predicted_throughput > 0 else 0.0
 
     critical_skus = 0
-    for m in materials_list:
+    for m in materials:
         max_qty = float(m.max_quantity or 100)
         if max_qty <= 0:
             continue
@@ -837,17 +918,12 @@ def compute_ai_insights_for_user(user):
         _aggregate_deadstock_capital(deadstock_list)
     )
 
+    # Accuracy samples — actual_week comes from Q3 map; no per-material DB query.
     accuracy_samples = []
-    week_ago = now - timezone.timedelta(days=7)
     for p in predictions_list:
         predicted_week = p["adc_30"] * 7
         actual_week = float(
-            StockTransaction.objects.filter(
-                material_id=p["material_id"],
-                type=StockTransaction.TYPE_OUT,
-                created_at__gte=week_ago,
-            ).aggregate(total=Sum("quantity"))["total"]
-            or 0
+            tx_agg_map.get(p["material_id"], {}).get("actual_week") or 0
         )
         if predicted_week <= 0 and actual_week <= 0:
             accuracy_samples.append(100.0)
@@ -862,7 +938,7 @@ def compute_ai_insights_for_user(user):
         else 94.0
     )
 
-    weekly_out = _build_weekly_out_totals(user, weeks=12)
+    weekly_out = _build_weekly_out_totals(user, weeks=12)  # Q5
     throughput_weekly = [
         sum(
             p["adc_30"] * 7

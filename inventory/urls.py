@@ -9,6 +9,7 @@ from .views import (
     ReportView,
     StockTransactionListCreateView,
     MaterialRequestListView,
+    MaterialRequestSummaryView,
     MaterialRequestReviewView,
     MaterialRequestCreateView,
     AIInsightsView,
@@ -45,6 +46,7 @@ urlpatterns = [
 
     # Material Requests
     path("requests/list/", MaterialRequestListView.as_view(), name="request-list"),
+    path("material-requests/summary/", MaterialRequestSummaryView.as_view(), name="request-summary"),
     path("requests/<int:pk>/review/", MaterialRequestReviewView.as_view(), name="request-review"),
     path("requests/create/", MaterialRequestCreateView.as_view(), name="request-create"),
 
