@@ -3,7 +3,7 @@ import dj_database_url
 
 DEBUG = env.bool("DEBUG", default=False)
 
-ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["stockpad-backend-production.up.railway.app", "127.0.0.1", "localhost"])
+ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["stockpad-backend-production-1de67.up.railway.app", "127.0.0.1", "localhost"])
 
 # Database — Parse DATABASE_URL from environment, then enforce WM_site schema routing.
 _db = dj_database_url.config(

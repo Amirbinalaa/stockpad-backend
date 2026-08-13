@@ -25,6 +25,7 @@ CSRF_TRUSTED_ORIGINS = env.list(
     "CSRF_TRUSTED_ORIGINS",
     default=[
         "https://stockpad-smoky.vercel.app",
+        "https://stockpad-backend-production-1de67.up.railway.app",
         "http://localhost:5500",
         "http://127.0.0.1:5500",
     ],
