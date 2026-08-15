@@ -263,7 +263,7 @@ class Product(models.Model):
         blank=True,
     )
     name = models.CharField(max_length=255)
-    sku = models.CharField(max_length=100)
+    sku = models.CharField(max_length=100, unique=True)
     category = models.CharField(max_length=100, blank=True)
     unit_of_measure = models.CharField(max_length=50)
     status = models.CharField(
