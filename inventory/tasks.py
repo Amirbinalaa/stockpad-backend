@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 import uuid
 import requests
 from urllib.parse import urlparse
@@ -107,7 +108,8 @@ def _build_webhook_headers(payload: dict) -> dict:
     signature = hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
     return {
         "Content-Type": "application/json",
-        "X-Site-A-Signature": signature,
+        "X-Webhook-Signature": signature,
+        "X-Webhook-Timestamp": str(int(time.time())),
     }
 
 
