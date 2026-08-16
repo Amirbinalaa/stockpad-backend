@@ -100,14 +100,20 @@ def ping_site_b_health(webhook_url: str) -> bool:
 
 def _build_webhook_headers(body_bytes: bytes) -> dict:
     """
-    Compute an HMAC-SHA256 signature using SITE_A_API_KEY over the provided body bytes.
+    Compute an HMAC-SHA256 signature using SITE_A_API_KEY.
+    The signing message is f"{timestamp}.{body_str}", where timestamp is the
+    same UTC unix timestamp string sent in X-Webhook-Timestamp, matching
+    Site B's expected signature verification format.
     """
     secret = getattr(settings, "SITE_A_API_KEY", "").encode("utf-8")
-    signature = hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
+    timestamp = str(int(time.time()))
+    body_str = body_bytes.decode("utf-8")
+    signing_message = f"{timestamp}.{body_str}".encode("utf-8")
+    signature = hmac.new(secret, signing_message, hashlib.sha256).hexdigest()
     return {
         "Content-Type": "application/json",
         "X-Webhook-Signature": signature,
-        "X-Webhook-Timestamp": str(int(time.time())),
+        "X-Webhook-Timestamp": timestamp,
     }
 
 
