@@ -98,13 +98,11 @@ def ping_site_b_health(webhook_url: str) -> bool:
         return False
 
 
-def _build_webhook_headers(payload: dict) -> dict:
+def _build_webhook_headers(body_bytes: bytes) -> dict:
     """
-    Serialize payload to JSON bytes and compute an HMAC-SHA256 signature
-    using SITE_A_API_KEY.
+    Compute an HMAC-SHA256 signature using SITE_A_API_KEY over the provided body bytes.
     """
     secret = getattr(settings, "SITE_A_API_KEY", "").encode("utf-8")
-    body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     signature = hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
     return {
         "Content-Type": "application/json",
@@ -173,7 +171,7 @@ def send_webhook_task(self, webhook_url: str, payload: dict) -> bool:
         webhook_url = f"{webhook_url}/"
 
     body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = _build_webhook_headers(payload)
+    headers = _build_webhook_headers(body_bytes)
 
     try:
         res = requests.post(
