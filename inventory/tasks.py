@@ -167,6 +167,9 @@ def send_webhook_task(self, webhook_url: str, payload: dict) -> bool:
     if not webhook_url:
         return False
 
+    if not webhook_url.endswith("/"):
+        webhook_url = f"{webhook_url}/"
+
     body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = _build_webhook_headers(payload)
 
